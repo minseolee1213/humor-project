@@ -13,21 +13,32 @@ interface Image {
 }
 
 async function getImages(): Promise<Image[]> {
-  const { data, error } = await supabase
-    .from('images')
-    .select('*')
-    .order('created_datetime_utc', { ascending: false });
+  try {
+    const { data, error } = await supabase
+      .from('images')
+      .select('*')
+      .order('created_datetime_utc', { ascending: false });
 
-  if (error) {
-    console.error('Error fetching images:', error);
+    if (error) {
+      console.error('Error fetching images:', error);
+      return [];
+    }
+
+    return data || [];
+  } catch (error) {
+    console.error('Error in getImages:', error);
     return [];
   }
-
-  return data || [];
 }
 
 export default async function Home() {
-  const images = await getImages();
+  let images: Image[] = [];
+  
+  try {
+    images = await getImages();
+  } catch (error) {
+    console.error('Error loading images:', error);
+  }
 
   return (
     <main className="min-h-screen p-8 bg-background">
