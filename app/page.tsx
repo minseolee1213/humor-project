@@ -21,9 +21,16 @@ async function getImages(): Promise<Image[]> {
 
     if (error) {
       console.error('Error fetching images:', error);
+      console.error('Error details:', {
+        message: error.message,
+        code: error.code,
+        details: error.details,
+        hint: error.hint
+      });
       return [];
     }
 
+    console.log(`Successfully fetched ${data?.length || 0} images`);
     return data || [];
   } catch (error) {
     console.error('Error in getImages:', error);
@@ -47,7 +54,18 @@ export default async function Home() {
         
         {images.length === 0 ? (
           <div className="text-center py-12">
-            <p className="text-lg text-foreground/70">No images found</p>
+            <p className="text-lg text-foreground/70 mb-4">No images found</p>
+            <div className="text-sm text-foreground/50 space-y-2">
+              <p>Possible reasons:</p>
+              <ul className="list-disc list-inside space-y-1">
+                <li>The images table is empty</li>
+                <li>Row Level Security (RLS) policies are blocking access</li>
+                <li>Check the browser console for connection errors</li>
+              </ul>
+              <p className="mt-4 text-xs">
+                Check your Supabase dashboard → Table Editor → images to verify data exists
+              </p>
+            </div>
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
