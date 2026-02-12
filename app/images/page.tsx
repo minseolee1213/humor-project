@@ -17,7 +17,7 @@ interface Image {
 
 async function getImages(): Promise<Image[]> {
   try {
-    const supabase = createClient();
+    const supabase = await createClient();
     const { data, error } = await supabase
       .from('images')
       .select('*')
@@ -50,7 +50,7 @@ async function getImages(): Promise<Image[]> {
 }
 
 export default async function ImagesPage() {
-  const supabase = createClient();
+  const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
 
   // If not authenticated, show gated UI
