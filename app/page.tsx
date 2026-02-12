@@ -1,4 +1,9 @@
-import { supabase } from '@/lib/supabase';
+import { createClient } from '@/lib/supabase/server';
+import SignInButton from '@/app/SignInButton';
+import SignOutButton from '@/app/SignOutButton';
+
+// Force dynamic rendering since we use cookies for auth
+export const dynamic = 'force-dynamic';
 
 interface Image {
   id: string;
@@ -14,11 +19,11 @@ interface Image {
 
 async function getImages(): Promise<Image[]> {
   try {
-    // Try to fetch public images first, or all if RLS allows
+    const supabase = await createClient();
     const { data, error } = await supabase
       .from('images')
       .select('*')
-      .eq('is_public', true) // Only fetch public images
+      .eq('is_public', true)
       .order('created_datetime_utc', { ascending: false });
 
     if (error) {
@@ -33,6 +38,7 @@ async function getImages(): Promise<Image[]> {
       // If filtering by is_public fails, try without filter (might be RLS issue)
       if (error.code === '42501' || error.message.includes('policy')) {
         console.log('Trying to fetch all images without filter...');
+        const supabase = await createClient();
         const { data: allData, error: allError } = await supabase
           .from('images')
           .select('*')
@@ -56,6 +62,35 @@ async function getImages(): Promise<Image[]> {
 }
 
 export default async function Home() {
+  // Check authentication
+  let user = null;
+  
+  try {
+    const supabase = await createClient();
+    const { data, error } = await supabase.auth.getUser();
+    if (!error) {
+      user = data.user;
+    }
+  } catch (error) {
+    console.error('Error getting user:', error);
+  }
+
+  // If not authenticated, show gated UI
+  if (!user) {
+    return (
+      <main className="min-h-screen p-8 bg-background flex items-center justify-center">
+        <div className="max-w-md w-full text-center">
+          <h1 className="text-4xl font-bold mb-4 text-foreground">Images Gallery</h1>
+          <p className="text-lg text-foreground/70 mb-8">
+            Please sign in to view images
+          </p>
+          <SignInButton />
+        </div>
+      </main>
+    );
+  }
+
+  // User is authenticated, fetch and show images
   let images: Image[] = [];
   
   try {
@@ -67,7 +102,15 @@ export default async function Home() {
   return (
     <main className="min-h-screen p-8 bg-background">
       <div className="max-w-7xl mx-auto">
-        <h1 className="text-4xl font-bold mb-8 text-foreground">Images Gallery</h1>
+        <div className="flex justify-between items-center mb-8">
+          <h1 className="text-4xl font-bold text-foreground">Images Gallery</h1>
+          <div className="flex items-center gap-4">
+            <span className="text-sm text-foreground/70">
+              {user.email}
+            </span>
+            <SignOutButton />
+          </div>
+        </div>
         
         {images.length === 0 ? (
           <div className="text-center py-12">

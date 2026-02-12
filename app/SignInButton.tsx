@@ -6,8 +6,7 @@ export default function SignInButton() {
   const handleSignIn = async () => {
     const supabase = createClient();
     
-    // Use production URL: https://humor-project-vb4r.vercel.app/auth/callback
-    // Fallback to localhost for local dev: http://localhost:3000/auth/callback
+    // Use production URL, fallback to localhost for local dev
     const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || 
       (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000');
     const redirectTo = `${siteUrl}/auth/callback`;

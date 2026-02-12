@@ -79,7 +79,7 @@ vercel
 
    ```
    Name: NEXT_PUBLIC_SITE_URL
-   Value: https://my-next-app-ten-mu.vercel.app
+   Value: https://humor-project-vb4r.vercel.app
    Environment: Production, Preview, Development
    ```
 
@@ -110,7 +110,7 @@ vercel
 3. **Click on your OAuth 2.0 Client ID** (the one with the ID above)
 4. **Under "Authorized redirect URIs"**, add:
    ```
-   https://my-next-app-ten-mu.vercel.app/auth/callback
+   https://humor-project-vb4r.vercel.app/auth/callback
    ```
 5. **Also add for local development**:
    ```
@@ -120,7 +120,7 @@ vercel
 
 ## Step 5: Verify Deployment
 
-1. **Visit your deployed site**: `https://my-next-app-ten-mu.vercel.app/images`
+1. **Visit your deployed site**: `https://humor-project-vb4r.vercel.app/images`
 2. **You should see**:
    - Gated UI with "Sign in with Google" button (if not signed in)
    - Or the images gallery (if already signed in)

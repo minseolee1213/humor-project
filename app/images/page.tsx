@@ -3,6 +3,9 @@ import { redirect } from 'next/navigation';
 import SignInButton from './SignInButton';
 import SignOutButton from './SignOutButton';
 
+// Force dynamic rendering since we use cookies for auth
+export const dynamic = 'force-dynamic';
+
 interface Image {
   id: string;
   url: string | null;
@@ -50,8 +53,17 @@ async function getImages(): Promise<Image[]> {
 }
 
 export default async function ImagesPage() {
-  const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
+  let user = null;
+  
+  try {
+    const supabase = await createClient();
+    const { data, error } = await supabase.auth.getUser();
+    if (!error) {
+      user = data.user;
+    }
+  } catch (error) {
+    console.error('Error getting user:', error);
+  }
 
   // If not authenticated, show gated UI
   if (!user) {

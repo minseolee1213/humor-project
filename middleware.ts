@@ -6,10 +6,16 @@ export async function middleware(request: NextRequest) {
     request,
   });
 
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+  // If environment variables are missing, just pass through
+  if (!supabaseUrl || !supabaseAnonKey) {
+    return supabaseResponse;
+  }
+
+  try {
+    const supabase = createServerClient(supabaseUrl, supabaseAnonKey, {
       cookies: {
         getAll() {
           return request.cookies.getAll();
@@ -24,11 +30,20 @@ export async function middleware(request: NextRequest) {
           );
         },
       },
-    }
-  );
+    });
 
-  // Refresh session if expired - required for Server Components
-  await supabase.auth.getUser();
+    // Refresh session if expired - required for Server Components
+    // Don't throw if this fails, just continue
+    try {
+      await supabase.auth.getUser();
+    } catch (error) {
+      // Silently handle auth errors in middleware
+      console.error('Middleware auth error:', error);
+    }
+  } catch (error) {
+    // If Supabase client creation fails, just pass through
+    console.error('Middleware error:', error);
+  }
 
   return supabaseResponse;
 }
