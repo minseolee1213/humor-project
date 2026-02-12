@@ -1,4 +1,7 @@
-import { supabase } from '@/lib/supabase';
+import { createClient } from '@/lib/supabase/server';
+import { redirect } from 'next/navigation';
+import SignInButton from './SignInButton';
+import SignOutButton from './SignOutButton';
 
 interface Image {
   id: string;
@@ -14,25 +17,17 @@ interface Image {
 
 async function getImages(): Promise<Image[]> {
   try {
-    // Try to fetch public images first, or all if RLS allows
+    const supabase = createClient();
     const { data, error } = await supabase
       .from('images')
       .select('*')
-      .eq('is_public', true) // Only fetch public images
+      .eq('is_public', true)
       .order('created_datetime_utc', { ascending: false });
 
     if (error) {
       console.error('Error fetching images:', error);
-      console.error('Error details:', {
-        message: error.message,
-        code: error.code,
-        details: error.details,
-        hint: error.hint
-      });
       
-      // If filtering by is_public fails, try without filter (might be RLS issue)
       if (error.code === '42501' || error.message.includes('policy')) {
-        console.log('Trying to fetch all images without filter...');
         const { data: allData, error: allError } = await supabase
           .from('images')
           .select('*')
@@ -47,7 +42,6 @@ async function getImages(): Promise<Image[]> {
       return [];
     }
 
-    console.log(`Successfully fetched ${data?.length || 0} images`);
     return data || [];
   } catch (error) {
     console.error('Error in getImages:', error);
@@ -55,34 +49,44 @@ async function getImages(): Promise<Image[]> {
   }
 }
 
-export default async function Home() {
-  let images: Image[] = [];
-  
-  try {
-    images = await getImages();
-  } catch (error) {
-    console.error('Error loading images:', error);
+export default async function ImagesPage() {
+  const supabase = createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+
+  // If not authenticated, show gated UI
+  if (!user) {
+    return (
+      <main className="min-h-screen p-8 bg-background flex items-center justify-center">
+        <div className="max-w-md w-full text-center">
+          <h1 className="text-4xl font-bold mb-4 text-foreground">Images Gallery</h1>
+          <p className="text-lg text-foreground/70 mb-8">
+            Please sign in to view images
+          </p>
+          <SignInButton />
+        </div>
+      </main>
+    );
   }
+
+  // User is authenticated, show images
+  const images = await getImages();
 
   return (
     <main className="min-h-screen p-8 bg-background">
       <div className="max-w-7xl mx-auto">
-        <h1 className="text-4xl font-bold mb-8 text-foreground">Images Gallery</h1>
+        <div className="flex justify-between items-center mb-8">
+          <h1 className="text-4xl font-bold text-foreground">Images Gallery</h1>
+          <div className="flex items-center gap-4">
+            <span className="text-sm text-foreground/70">
+              {user.email}
+            </span>
+            <SignOutButton />
+          </div>
+        </div>
         
         {images.length === 0 ? (
           <div className="text-center py-12">
-            <p className="text-lg text-foreground/70 mb-4">No images found</p>
-            <div className="text-sm text-foreground/50 space-y-2">
-              <p>Possible reasons:</p>
-              <ul className="list-disc list-inside space-y-1">
-                <li>The images table is empty</li>
-                <li>Row Level Security (RLS) policies are blocking access</li>
-                <li>Check the browser console for connection errors</li>
-              </ul>
-              <p className="mt-4 text-xs">
-                Check your Supabase dashboard → Table Editor → images to verify data exists
-              </p>
-            </div>
+            <p className="text-lg text-foreground/70">No images found</p>
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">

@@ -7,10 +7,14 @@ const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 let supabaseClient;
 
 if (!supabaseUrl || !supabaseAnonKey) {
-  console.warn(
-    "Missing Supabase environment variables. Using dummy client. Please check your .env.local file."
-  );
-  // Create a dummy client with placeholder values
+  const isProduction = process.env.NODE_ENV === 'production';
+  const message = isProduction
+    ? "❌ Missing Supabase environment variables in production! Please set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in your deployment platform (Vercel/Netlify/etc). See DEPLOYMENT.md for instructions."
+    : "Missing Supabase environment variables. Using dummy client. Please check your .env.local file.";
+  
+  console.error(message);
+  
+  // Create a dummy client (will fail on actual queries, but won't break the build)
   supabaseClient = createClient("https://placeholder.supabase.co", "placeholder-key", {
     auth: { persistSession: false },
   });
