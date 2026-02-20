@@ -1,6 +1,7 @@
 import { createClient } from '@/lib/supabase/server';
 import SignInButton from '@/app/SignInButton';
 import SignOutButton from '@/app/SignOutButton';
+import ImageVoteButtons from '@/app/components/ImageVoteButtons';
 
 // Force dynamic rendering since we use cookies for auth
 export const dynamic = 'force-dynamic';
@@ -15,6 +16,12 @@ interface Image {
   is_common_use: boolean | null;
   additional_context: string | null;
   celebrity_recognition: string | null;
+}
+
+interface Caption {
+  id: string;
+  image_id: string;
+  content: string | null;
 }
 
 async function getImages(): Promise<Image[]> {
@@ -61,6 +68,76 @@ async function getImages(): Promise<Image[]> {
   }
 }
 
+async function getCaptionsForImages(imageIds: string[]): Promise<Record<string, Caption>> {
+  if (imageIds.length === 0) {
+    return {};
+  }
+
+  try {
+    const supabase = await createClient();
+    const { data, error } = await supabase
+      .from('captions')
+      .select('id, image_id, content')
+      .eq('is_public', true)
+      .in('image_id', imageIds)
+      .order('created_datetime_utc', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching captions:', error);
+      return {};
+    }
+
+    // Get the first caption for each image (or you could get all and let UI decide)
+    const captionMap: Record<string, Caption> = {};
+    if (data) {
+      // Use the first caption found for each image
+      data.forEach((caption) => {
+        if (!captionMap[caption.image_id]) {
+          captionMap[caption.image_id] = caption;
+        }
+      });
+    }
+
+    return captionMap;
+  } catch (error) {
+    console.error('Error in getCaptionsForImages:', error);
+    return {};
+  }
+}
+
+async function getUserVotes(profileId: string, captionIds: string[]): Promise<Record<string, number>> {
+  if (!profileId || captionIds.length === 0) {
+    return {};
+  }
+
+  try {
+    const supabase = await createClient();
+    const { data, error } = await supabase
+      .from('caption_votes')
+      .select('caption_id, vote_value')
+      .eq('profile_id', profileId)
+      .in('caption_id', captionIds);
+
+    if (error) {
+      console.error('Error fetching user votes:', error);
+      return {};
+    }
+
+    const votesMap: Record<string, number> = {};
+    if (data) {
+      data.forEach((vote) => {
+        votesMap[vote.caption_id] = vote.vote_value;
+      });
+    }
+
+    return votesMap;
+  } catch (error) {
+    console.error('Error in getUserVotes:', error);
+    return {};
+  }
+}
+
+
 export default async function Home() {
   // Check authentication
   let user = null;
@@ -80,9 +157,9 @@ export default async function Home() {
     return (
       <main className="min-h-screen p-8 bg-background flex items-center justify-center">
         <div className="max-w-md w-full text-center">
-          <h1 className="text-4xl font-bold mb-4 text-foreground">Images Gallery</h1>
+          <h1 className="text-4xl font-bold mb-4 text-foreground">Rate Captions</h1>
           <p className="text-lg text-foreground/70 mb-8">
-            Please sign in to view images
+            Please sign in to rate images!
           </p>
           <SignInButton />
         </div>
@@ -92,9 +169,33 @@ export default async function Home() {
 
   // User is authenticated, fetch and show images
   let images: Image[] = [];
+  let captionsByImageId: Record<string, Caption> = {};
+  let userVotes: Record<string, number> = {};
+  let profileId: string | null = null;
   
   try {
     images = await getImages();
+    
+    // Get captions for all images
+    if (images.length > 0) {
+      const imageIds = images.map(img => img.id);
+      captionsByImageId = await getCaptionsForImages(imageIds);
+      
+      // Get user's votes for existing captions
+      const supabase = await createClient();
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('id', user.id)
+        .single();
+      
+      profileId = profile?.id || user.id;
+      
+      const captionIds = Object.values(captionsByImageId).map(c => c.id);
+      if (captionIds.length > 0) {
+        userVotes = await getUserVotes(profileId, captionIds);
+      }
+    }
   } catch (error) {
     console.error('Error loading images:', error);
   }
@@ -103,8 +204,14 @@ export default async function Home() {
     <main className="min-h-screen p-8 bg-background">
       <div className="max-w-7xl mx-auto">
         <div className="flex justify-between items-center mb-8">
-          <h1 className="text-4xl font-bold text-foreground">Images Gallery</h1>
+          <h1 className="text-4xl font-bold text-foreground">Rate Captions</h1>
           <div className="flex items-center gap-4">
+            <a
+              href="/upload"
+              className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
+            >
+              Upload
+            </a>
             <span className="text-sm text-foreground/70">
               {user.email}
             </span>
@@ -178,6 +285,15 @@ export default async function Home() {
                   <p className="text-xs text-foreground/50 mt-2">
                     {new Date(image.created_datetime_utc).toLocaleDateString()}
                   </p>
+                  
+                  {/* Vote Buttons Section - Always rendered */}
+                  <div className="mt-4 pt-3 border-t border-gray-200 dark:border-gray-700">
+                    <ImageVoteButtons
+                      captionId={captionsByImageId[image.id]?.id || null}
+                      isAuthenticated={!!user}
+                      currentVote={captionsByImageId[image.id] ? (userVotes[captionsByImageId[image.id].id] || null) : null}
+                    />
+                  </div>
                 </div>
               </div>
             ))}
