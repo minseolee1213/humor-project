@@ -6,7 +6,7 @@ export const dynamic = 'force-dynamic';
 
 export async function POST(
   request: NextRequest,
-  { params }: { params: { id: string } }
+  context: { params: Promise<{ id: string }> }
 ) {
   try {
     const supabase = await createClient();
@@ -22,7 +22,8 @@ export async function POST(
     }
 
     // Get caption ID from params
-    const captionId = params.id;
+    const { id } = await context.params;
+    const captionId = id;
     
     if (!captionId) {
       return NextResponse.json(
@@ -103,57 +104,30 @@ export async function POST(
     // Unique constraint on (profile_id, caption_id)
     const nowIso = new Date().toISOString();
     
-    // Try insert first to get created_datetime_utc set correctly
-    const insertData = {
+    // Check if vote already exists to preserve created_datetime_utc
+    const { data: existingVote } = await supabase
+      .from('caption_votes')
+      .select('created_datetime_utc')
+      .eq('profile_id', profileId)
+      .eq('caption_id', captionId)
+      .single();
+
+    const voteData = {
       caption_id: captionId,
       profile_id: profileId,
       vote_value: voteValue,
-      created_datetime_utc: nowIso,
-      modified_datetime_utc: nowIso,
+      created_datetime_utc: existingVote?.created_datetime_utc || nowIso, // Preserve existing or set new
+      modified_datetime_utc: nowIso, // Always update
     };
 
-    let result;
-    let voteError;
-
-    // Try insert first
-    const insertResult = await supabase
+    // Use UPSERT with onConflict to handle unique constraint
+    const { data: voteResult, error: voteError } = await supabase
       .from('caption_votes')
-      .insert(insertData)
+      .upsert(voteData, {
+        onConflict: 'profile_id,caption_id',
+      })
       .select()
       .single();
-
-    if (insertResult.error) {
-      // If insert fails with unique constraint violation, update instead
-      if (insertResult.error.code === '23505') {
-        // Unique constraint violation - update existing vote
-        const updateResult = await supabase
-          .from('caption_votes')
-          .update({
-            vote_value: voteValue,
-            modified_datetime_utc: nowIso,
-          })
-          .eq('profile_id', profileId)
-          .eq('caption_id', captionId)
-          .select()
-          .single();
-
-        if (updateResult.error) {
-          voteError = updateResult.error;
-          result = updateResult;
-        } else {
-          voteError = null;
-          result = updateResult;
-        }
-      } else {
-        // Other error
-        voteError = insertResult.error;
-        result = insertResult;
-      }
-    } else {
-      // Insert succeeded
-      voteError = null;
-      result = insertResult;
-    }
 
     if (voteError) {
       console.error('Error upserting vote:', voteError);
@@ -167,7 +141,7 @@ export async function POST(
       { 
         success: true, 
         message: 'Vote submitted successfully',
-        vote: result.data 
+        vote: voteResult 
       },
       { status: 200 }
     );

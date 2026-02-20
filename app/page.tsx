@@ -18,12 +18,6 @@ interface Image {
   celebrity_recognition: string | null;
 }
 
-interface Caption {
-  id: string;
-  image_id: string;
-  content: string | null;
-}
-
 async function getImages(): Promise<Image[]> {
   try {
     const supabase = await createClient();
@@ -68,76 +62,6 @@ async function getImages(): Promise<Image[]> {
   }
 }
 
-async function getCaptionsForImages(imageIds: string[]): Promise<Record<string, Caption>> {
-  if (imageIds.length === 0) {
-    return {};
-  }
-
-  try {
-    const supabase = await createClient();
-    const { data, error } = await supabase
-      .from('captions')
-      .select('id, image_id, content')
-      .eq('is_public', true)
-      .in('image_id', imageIds)
-      .order('created_datetime_utc', { ascending: false });
-
-    if (error) {
-      console.error('Error fetching captions:', error);
-      return {};
-    }
-
-    // Get the first caption for each image (or you could get all and let UI decide)
-    const captionMap: Record<string, Caption> = {};
-    if (data) {
-      // Use the first caption found for each image
-      data.forEach((caption) => {
-        if (!captionMap[caption.image_id]) {
-          captionMap[caption.image_id] = caption;
-        }
-      });
-    }
-
-    return captionMap;
-  } catch (error) {
-    console.error('Error in getCaptionsForImages:', error);
-    return {};
-  }
-}
-
-async function getUserVotes(profileId: string, captionIds: string[]): Promise<Record<string, number>> {
-  if (!profileId || captionIds.length === 0) {
-    return {};
-  }
-
-  try {
-    const supabase = await createClient();
-    const { data, error } = await supabase
-      .from('caption_votes')
-      .select('caption_id, vote_value')
-      .eq('profile_id', profileId)
-      .in('caption_id', captionIds);
-
-    if (error) {
-      console.error('Error fetching user votes:', error);
-      return {};
-    }
-
-    const votesMap: Record<string, number> = {};
-    if (data) {
-      data.forEach((vote) => {
-        votesMap[vote.caption_id] = vote.vote_value;
-      });
-    }
-
-    return votesMap;
-  } catch (error) {
-    console.error('Error in getUserVotes:', error);
-    return {};
-  }
-}
-
-
 export default async function Home() {
   // Check authentication
   let user = null;
@@ -169,33 +93,9 @@ export default async function Home() {
 
   // User is authenticated, fetch and show images
   let images: Image[] = [];
-  let captionsByImageId: Record<string, Caption> = {};
-  let userVotes: Record<string, number> = {};
-  let profileId: string | null = null;
   
   try {
     images = await getImages();
-    
-    // Get captions for all images
-    if (images.length > 0) {
-      const imageIds = images.map(img => img.id);
-      captionsByImageId = await getCaptionsForImages(imageIds);
-      
-      // Get user's votes for existing captions
-      const supabase = await createClient();
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('id')
-        .eq('id', user.id)
-        .single();
-      
-      profileId = profile?.id || user.id;
-      
-      const captionIds = Object.values(captionsByImageId).map(c => c.id);
-      if (captionIds.length > 0) {
-        userVotes = await getUserVotes(profileId, captionIds);
-      }
-    }
   } catch (error) {
     console.error('Error loading images:', error);
   }
@@ -289,9 +189,10 @@ export default async function Home() {
                   {/* Vote Buttons Section - Always rendered */}
                   <div className="mt-4 pt-3 border-t border-gray-200 dark:border-gray-700">
                     <ImageVoteButtons
-                      captionId={captionsByImageId[image.id]?.id || null}
+                      key={`vote-${image.id}`}
+                      captionId={null}
                       isAuthenticated={!!user}
-                      currentVote={captionsByImageId[image.id] ? (userVotes[captionsByImageId[image.id].id] || null) : null}
+                      currentVote={null}
                     />
                   </div>
                 </div>
