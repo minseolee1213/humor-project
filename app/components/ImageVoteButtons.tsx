@@ -2,6 +2,7 @@
 
 import { useState, memo, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
+import { createClient } from '@/lib/supabase/client';
 
 interface ImageVoteButtonsProps {
   captionId: string | null; // null if no caption exists for this image
@@ -37,7 +38,7 @@ function ImageVoteButtons({
     // Early return guard: Check if user is logged in
     if (!isAuthenticated) {
       setError('Please sign in to vote.');
-      setSuccess(null); // Explicitly clear success
+      setSuccess(null);
       setTimeout(() => {
         setError(null);
       }, 5000);
@@ -45,12 +46,11 @@ function ImageVoteButtons({
     }
 
     // Early return guard: Check if caption exists
-    // Check for null, undefined, empty string, or whitespace-only
     const hasValidCaption = captionId && typeof captionId === 'string' && captionId.trim().length > 0;
     
     if (!hasValidCaption) {
       setError('Error: caption is null.');
-      setSuccess(null); // Explicitly clear success - CRITICAL
+      setSuccess(null);
       setTimeout(() => {
         setError(null);
       }, 5000);
@@ -58,53 +58,108 @@ function ImageVoteButtons({
     }
 
     // Both conditions met: user is logged in AND caption exists
-    // Only now do we proceed with API call
     setIsLoading(true);
     setError(null);
-    setSuccess(null); // Double-check success is cleared
+    setSuccess(null);
 
     try {
-      const response = await fetch(`/api/captions/${captionId}/vote`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ vote_value: voteType === 'up' ? 1 : -1 }),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to submit vote');
-      }
-
-      // CRITICAL: Only set success if we still have a valid captionId
-      // Double-check before setting success to prevent showing success on cards without captions
-      const stillHasValidCaption = captionId && typeof captionId === 'string' && captionId.trim().length > 0;
+      const supabase = createClient();
       
-      if (stillHasValidCaption) {
-        setSuccess('Vote submitted successfully!');
-        
-        // Refresh the page to show updated vote counts
-        router.refresh();
-
-        // Clear success message after 3 seconds
-        setTimeout(() => {
-          setSuccess(null);
-        }, 3000);
-      } else {
-        // This should never happen if guards worked, but defensive check
-        console.error('Attempted to set success but captionId is invalid:', captionId);
-        setError('Error: caption is null.');
+      // Get current user session
+      const { data: { user }, error: authError } = await supabase.auth.getUser();
+      
+      if (authError || !user) {
+        setError('Session not recognized on server—please sign in again.');
         setSuccess(null);
+        setTimeout(() => {
+          setError(null);
+        }, 5000);
+        return;
       }
+
+      // Resolve profile_id
+      let profileId: string;
+      
+      // Try to get profile by matching profiles.id with auth.users.id
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('id', user.id)
+        .single();
+
+      if (profile) {
+        profileId = profile.id;
+      } else {
+        // Try alternative: check if there's a user_id column in profiles
+        const { data: profileByUserId } = await supabase
+          .from('profiles')
+          .select('id')
+          .eq('user_id', user.id)
+          .single();
+        
+        if (profileByUserId) {
+          profileId = profileByUserId.id;
+        } else {
+          // Fallback: assume profiles.id = auth.users.id
+          profileId = user.id;
+        }
+      }
+
+      // Check if existing vote exists to preserve created_datetime_utc
+      const { data: existingVote } = await supabase
+        .from('caption_votes')
+        .select('created_datetime_utc')
+        .eq('profile_id', profileId)
+        .eq('caption_id', captionId)
+        .single();
+
+      const nowIso = new Date().toISOString();
+      const voteValue = voteType === 'up' ? 1 : -1;
+
+      const voteData = {
+        caption_id: captionId,
+        profile_id: profileId,
+        vote_value: voteValue,
+        created_datetime_utc: existingVote?.created_datetime_utc || nowIso,
+        modified_datetime_utc: nowIso,
+      };
+
+      // Use UPSERT with onConflict
+      const { data: voteResult, error: voteError } = await supabase
+        .from('caption_votes')
+        .upsert(voteData, {
+          onConflict: 'profile_id,caption_id',
+        })
+        .select()
+        .single();
+
+      if (voteError) {
+        // Check for auth errors
+        if (voteError.code === 'PGRST301' || voteError.message.includes('JWT') || voteError.message.includes('auth')) {
+          setError('Session not recognized on server—please sign in again.');
+        } else {
+          setError(voteError.message || 'Failed to submit vote');
+        }
+        setSuccess(null);
+        setTimeout(() => {
+          setError(null);
+        }, 5000);
+        return;
+      }
+
+      // Success!
+      setSuccess('Vote submitted successfully!');
+      router.refresh();
+
+      setTimeout(() => {
+        setSuccess(null);
+      }, 3000);
 
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : 'An error occurred';
       setError(errorMessage);
-      setSuccess(null); // Clear success when error occurs
+      setSuccess(null);
       
-      // Clear error message after 5 seconds
       setTimeout(() => {
         setError(null);
       }, 5000);
