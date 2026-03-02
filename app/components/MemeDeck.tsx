@@ -41,6 +41,9 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
     userId: string | null;
     captionId: string | null;
     voteValue: number | null;
+    lastStatus: number | null;
+    lastErrorMessage: string | null;
+    lastRequestBody: { captionId: string | null; voteValue: number | null } | null;
     lastResponse: { 
       success: boolean; 
       error?: string; 
@@ -55,6 +58,9 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
     userId: null,
     captionId: null,
     voteValue: null,
+    lastStatus: null,
+    lastErrorMessage: null,
+    lastRequestBody: null,
     lastResponse: null,
     authLoaded: false,
   });
@@ -527,12 +533,22 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
     try {
       // Use hydrated user state for debug info
       const currentUserId = user?.id || null;
+      
+      // Ensure voteValue is always 1 or -1
+      const voteValueNumber: 1 | -1 = voteValue === 1 ? 1 : -1;
+      const requestBody = {
+        captionId: currentSlide.captionId,
+        voteValue: voteValueNumber,
+      };
 
       // Update debug info before vote
       setVoteDebugInfo({
         userId: currentUserId,
         captionId: currentSlide.captionId,
-        voteValue: voteValue,
+        voteValue: voteValueNumber,
+        lastStatus: null,
+        lastErrorMessage: null,
+        lastRequestBody: requestBody,
         lastResponse: null,
         authLoaded: authLoaded,
       });
@@ -541,17 +557,24 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
       const response = await fetch('/api/vote', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          captionId: currentSlide.captionId,
-          voteValue: voteValue,
-        }),
+        body: JSON.stringify(requestBody),
       });
 
-      const result = await response.json();
+      let result;
+      try {
+        result = await response.json();
+      } catch (jsonError) {
+        console.error('[MemeDeck] Failed to parse response JSON:', jsonError);
+        const errorText = await response.text();
+        result = { success: false, error: `Invalid JSON response: ${errorText}` };
+      }
 
       // Update debug info with response
+      const errorMessage = result.error || (response.ok ? null : `HTTP ${response.status}`);
       setVoteDebugInfo(prev => ({
         ...prev,
+        lastStatus: response.status,
+        lastErrorMessage: errorMessage,
         lastResponse: result,
         authLoaded: authLoaded,
       }));
@@ -561,12 +584,13 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
         console.log('[MemeDeck] VOTE API RESPONSE', { 
           status: response.status, 
           ok: response.ok, 
-          result 
+          result,
+          requestBody,
         });
       }
 
       if (!response.ok || !result.success) {
-        const errorMsg = result.error || 'Failed to save vote';
+        const errorMsg = result.error || `HTTP ${response.status}: Failed to save vote`;
         const displayError = `Vote failed: ${errorMsg}`;
         setVoteError(displayError);
         setToast({ 
@@ -633,6 +657,16 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
     } catch (err) {
       console.error('[MemeDeck] Error voting:', err);
       const errorMessage = err instanceof Error ? err.message : 'Failed to save vote';
+      
+      // Update debug info with error
+      setVoteDebugInfo(prev => ({
+        ...prev,
+        lastStatus: null,
+        lastErrorMessage: errorMessage,
+        lastResponse: { success: false, error: errorMessage },
+        authLoaded: authLoaded,
+      }));
+      
       setVoteError(`Vote failed: ${errorMessage}`);
       setToast({ 
         message: 'Failed to save vote', 
@@ -912,9 +946,33 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
                   <div className="space-y-1 text-gray-600 dark:text-gray-400">
                     <div>Auth Loaded: <span className={`font-mono ${authLoaded ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>{authLoaded ? '✅ Yes' : '❌ No'}</span></div>
                     <div>User ID: <span className="font-mono text-[10px]">{user?.id || voteDebugInfo.userId || 'null'}</span></div>
-                    <div>Caption ID: <span className="font-mono text-[10px]">{voteDebugInfo.captionId || currentSlide?.captionId || 'null'}</span></div>
-                    <div>Vote Value: <span className="font-mono">{voteDebugInfo.voteValue !== null ? voteDebugInfo.voteValue : (myVote !== undefined ? myVote : 'null')}</span></div>
-                    <div>Votes in State: <span className="font-mono">{Object.keys(userVotes).length}</span></div>
+                    <div className="mt-2 pt-2 border-t border-gray-300 dark:border-gray-600">
+                      <div className="text-[10px] font-semibold">Last Request:</div>
+                      {voteDebugInfo.lastRequestBody ? (
+                        <>
+                          <div className="text-[10px] ml-2">Caption ID: <span className="font-mono">{voteDebugInfo.lastRequestBody.captionId || 'null'}</span></div>
+                          <div className="text-[10px] ml-2">Vote Value: <span className="font-mono">{voteDebugInfo.lastRequestBody.voteValue !== null ? voteDebugInfo.lastRequestBody.voteValue : 'null'}</span></div>
+                        </>
+                      ) : (
+                        <div className="text-[10px] ml-2 text-gray-400">—</div>
+                      )}
+                    </div>
+                    <div className="mt-2 pt-2 border-t border-gray-300 dark:border-gray-600">
+                      <div className="text-[10px] font-semibold">Last Response:</div>
+                      <div className="text-[10px] ml-2">Status: <span className={`font-mono ${voteDebugInfo.lastStatus ? (voteDebugInfo.lastStatus >= 200 && voteDebugInfo.lastStatus < 300 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400') : 'text-gray-400'}`}>{voteDebugInfo.lastStatus || '—'}</span></div>
+                      {voteDebugInfo.lastErrorMessage && (
+                        <div className="text-[10px] ml-2 text-red-600 dark:text-red-400">Error: <span className="font-mono">{voteDebugInfo.lastErrorMessage}</span></div>
+                      )}
+                      {voteDebugInfo.lastResponse && (
+                        <div className="text-[10px] ml-2">Success: <span className={`font-mono ${voteDebugInfo.lastResponse.success ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>{voteDebugInfo.lastResponse.success ? '✅ Yes' : '❌ No'}</span></div>
+                      )}
+                    </div>
+                    <div className="mt-2 pt-2 border-t border-gray-300 dark:border-gray-600">
+                      <div className="text-[10px]">Current State:</div>
+                      <div className="text-[10px] ml-2">Caption ID: <span className="font-mono">{currentSlide?.captionId || 'null'}</span></div>
+                      <div className="text-[10px] ml-2">My Vote: <span className="font-mono">{myVote !== undefined ? myVote : 'null'}</span></div>
+                      <div className="text-[10px] ml-2">Votes in State: <span className="font-mono">{Object.keys(userVotes).length}</span></div>
+                    </div>
                     {voteDebugInfo.lastResponse?.voteHydration && (
                       <div className="mt-2 pt-2 border-t border-gray-300 dark:border-gray-600">
                         <div className="text-[10px]">Vote Hydration:</div>
@@ -922,20 +980,16 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
                         <div className="text-[10px] ml-2">Votes Fetched: {voteDebugInfo.lastResponse.voteHydration.votesFetched}</div>
                       </div>
                     )}
-                    <div className="mt-2">
-                      Last Response:
-                      {voteDebugInfo.lastResponse ? (
-                        <div className="ml-2 mt-1">
-                          {voteDebugInfo.lastResponse.success ? (
-                            <span className="text-green-600 dark:text-green-400">✅ Success</span>
-                          ) : (
-                            <span className="text-red-600 dark:text-red-400">❌ {voteDebugInfo.lastResponse.error || 'Unknown error'}</span>
-                          )}
-                        </div>
-                      ) : (
-                        <span className="ml-2 text-gray-400">—</span>
-                      )}
-                    </div>
+                    {!authLoaded && (
+                      <div className="mt-2 text-yellow-600 dark:text-yellow-400 text-[10px]">
+                        ⚠️ Auth not loaded - voting disabled
+                      </div>
+                    )}
+                    {authLoaded && !user && (
+                      <div className="mt-2 text-orange-600 dark:text-orange-400 text-[10px]">
+                        ⚠️ Not signed in - voting disabled
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

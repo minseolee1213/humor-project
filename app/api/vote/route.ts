@@ -23,18 +23,40 @@ export async function POST(req: Request) {
     console.log('[API /vote] Authenticated user:', user.id);
 
     // Parse request body
-    const body = await req.json();
-    const { captionId, voteValue } = body;
-
-    console.log('[API /vote] Vote request:', { captionId, voteValue, userId: user.id });
-
-    // Validate payload
-    if (!captionId || (voteValue !== 1 && voteValue !== -1)) {
+    let body;
+    try {
+      body = await req.json();
+    } catch (parseError) {
+      console.error('[API /vote] JSON parse error:', parseError);
       return NextResponse.json(
-        { success: false, error: 'Invalid payload. captionId and voteValue (1 or -1) are required.' },
+        { success: false, error: 'Invalid JSON in request body' },
         { status: 400 }
       );
     }
+
+    // Validate and extract values
+    const captionId = body?.captionId;
+    const voteValue = body?.voteValue;
+
+    // Validate captionId
+    if (!captionId) {
+      console.error('[API /vote] Missing captionId in request body:', body);
+      return NextResponse.json(
+        { success: false, error: 'Missing captionId' },
+        { status: 400 }
+      );
+    }
+
+    // Validate voteValue
+    if (voteValue !== 1 && voteValue !== -1) {
+      console.error('[API /vote] Invalid voteValue:', { voteValue, type: typeof voteValue });
+      return NextResponse.json(
+        { success: false, error: 'voteValue must be 1 or -1' },
+        { status: 400 }
+      );
+    }
+
+    console.log('[API /vote] Vote request body:', JSON.stringify({ captionId, voteValue, userId: user.id }));
 
     // Use user.id as profile_id (profiles.id = user.id in our schema)
     const profileId = user.id;
