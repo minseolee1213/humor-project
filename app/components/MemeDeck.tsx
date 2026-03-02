@@ -37,33 +37,6 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
   const [clickedButton, setClickedButton] = useState<'like' | 'dislike' | null>(null);
   const [voteError, setVoteError] = useState<string | null>(null);
   const [voteLoadError, setVoteLoadError] = useState<string | null>(null);
-  const [voteDebugInfo, setVoteDebugInfo] = useState<{
-    userId: string | null;
-    captionId: string | null;
-    voteValue: number | null;
-    lastStatus: number | null;
-    lastErrorMessage: string | null;
-    lastRequestBody: { captionId: string | null; voteValue: number | null } | null;
-    lastResponse: { 
-      success: boolean; 
-      error?: string; 
-      vote?: any;
-      voteHydration?: {
-        captionIdsRequested: number;
-        votesFetched: number;
-      };
-    } | null;
-    authLoaded: boolean;
-  }>({
-    userId: null,
-    captionId: null,
-    voteValue: null,
-    lastStatus: null,
-    lastErrorMessage: null,
-    lastRequestBody: null,
-    lastResponse: null,
-    authLoaded: false,
-  });
   const [hasMore, setHasMore] = useState(true);
   const [currentPage, setCurrentPage] = useState(0);
   const [profileId, setProfileId] = useState<string | null>(null);
@@ -139,7 +112,7 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
   }, [userId]);
 
   // Load user votes for captions and merge into votesByCaptionId
-  // Supports pagination by merging new votes with existing ones
+  // Uses chunked queries to avoid 400 Bad Request from very long IN clauses
   const loadUserVotesForCaptions = useCallback(async (captionIds: string[], userProfileId: string | null) => {
     if (captionIds.length === 0) {
       console.log('[MemeDeck] DEBUG - Skipping vote fetch: no captionIds');
@@ -155,96 +128,69 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
     try {
       const supabase = createClient();
 
-      console.log('[MemeDeck] DEBUG - Fetching votes for', captionIds.length, 'captions (profileId:', userProfileId, ')');
+      console.log('[MemeDeck] DEBUG - Fetching votes for', captionIds.length, 'captions in chunks (profileId:', userProfileId, ')');
 
-      const { data, error } = await supabase
-        .from('caption_votes')
-        .select('caption_id, vote_value')
-        .eq('profile_id', userProfileId)
-        .in('caption_id', captionIds);
+      const CHUNK_SIZE = 75;
+      const aggregatedVotes: Record<string, 1 | -1> = {};
 
-      if (error) {
-        console.error('[MemeDeck] Error fetching votes:', error);
-        // Check for RLS errors
-        if (error.code === 'PGRST301' || error.message?.includes('RLS') || error.message?.includes('permission') || error.message?.includes('policy')) {
-          const errorMsg = "Votes can't be loaded (RLS)";
-          setVoteLoadError(process.env.NODE_ENV === 'development' ? `${errorMsg}: ${error.message}` : errorMsg);
-        } else {
-          // Clear any previous RLS error if it's a different error
-          setVoteLoadError(null);
+      for (let i = 0; i < captionIds.length; i += CHUNK_SIZE) {
+        const chunk = captionIds.slice(i, i + CHUNK_SIZE);
+
+        const { data, error } = await supabase
+          .from('caption_votes')
+          .select('caption_id, vote_value')
+          .eq('profile_id', userProfileId)
+          .in('caption_id', chunk);
+
+        if (error) {
+          console.error('[MemeDeck] Error fetching votes chunk:', {
+            error,
+            chunkSize: chunk.length,
+          });
+          // Check for RLS errors
+          if (
+            error.code === 'PGRST301' ||
+            error.message?.includes('RLS') ||
+            error.message?.includes('permission') ||
+            error.message?.includes('policy')
+          ) {
+            const errorMsg = "Votes can't be loaded (RLS)";
+            setVoteLoadError(
+              process.env.NODE_ENV === 'development'
+                ? `${errorMsg}: ${error.message}`
+                : errorMsg
+            );
+          } else {
+            // Clear any previous RLS error if it's a different error
+            setVoteLoadError(null);
+          }
+          // If any chunk fails, stop further requests
+          return;
         }
-        
-        // Update debug info with error
-        if (process.env.NODE_ENV === 'development') {
-          setVoteDebugInfo(prev => ({
-            ...prev,
-            lastResponse: {
-              success: false,
-              error: error.message,
-              voteHydration: {
-                captionIdsRequested: captionIds.length,
-                votesFetched: 0,
-              },
-            },
-          }));
+
+        if (data && data.length > 0) {
+          data.forEach((vote) => {
+            if (vote.vote_value === 1 || vote.vote_value === -1) {
+              aggregatedVotes[vote.caption_id] = vote.vote_value as 1 | -1;
+            }
+          });
         }
-        return;
       }
-      
+
       // Clear RLS error on successful load
       setVoteLoadError(null);
 
-      if (data && data.length > 0) {
-        // Build new votes map from fetched data
-        const newVotes: Record<string, 1 | -1> = {};
-        data.forEach((vote) => {
-          if (vote.vote_value === 1 || vote.vote_value === -1) {
-            newVotes[vote.caption_id] = vote.vote_value as 1 | -1;
-          }
-        });
-        
-        // Merge new votes with existing votes (pagination support)
-        setUserVotes(prev => ({
+      const votesLoadedCount = Object.keys(aggregatedVotes).length;
+      console.log('[MemeDeck] DEBUG - Vote hydration complete:', {
+        captionIdsRequested: captionIds.length,
+        votesFetched: votesLoadedCount,
+      });
+
+      if (votesLoadedCount > 0) {
+        setUserVotes((prev) => ({
           ...prev,
-          ...newVotes
+          ...aggregatedVotes,
         }));
-        
-        // DEBUG: Log votes loaded
-        const votesLoadedCount = Object.keys(newVotes).length;
-        console.log('[MemeDeck] DEBUG - Vote hydration:', {
-          captionIdsRequested: captionIds.length,
-          votesFetched: votesLoadedCount,
-          captionIds: captionIds.slice(0, 5), // Show first 5 for debugging
-          votes: Object.keys(newVotes).slice(0, 5),
-        });
-        
-        // Update debug info with vote hydration stats
-        if (process.env.NODE_ENV === 'development') {
-          setVoteDebugInfo(prev => ({
-            ...prev,
-            lastResponse: {
-              success: true,
-              voteHydration: {
-                captionIdsRequested: captionIds.length,
-                votesFetched: votesLoadedCount,
-              },
-            },
-          }));
-        }
-      } else {
-        console.log('[MemeDeck] DEBUG - No votes found for', captionIds.length, 'captions');
-        if (process.env.NODE_ENV === 'development') {
-          setVoteDebugInfo(prev => ({
-            ...prev,
-            lastResponse: {
-              success: true,
-              voteHydration: {
-                captionIdsRequested: captionIds.length,
-                votesFetched: 0,
-              },
-            },
-          }));
-        }
       }
     } catch (err) {
       console.error('[MemeDeck] Error fetching user votes:', err);
@@ -530,10 +476,14 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
     setToast(null);
     setVoteError(null);
 
+    // Optimistic update: remember previous vote so we can revert on error
+    const previousVote = userVotes[currentSlide.captionId];
+    setUserVotes(prev => ({
+      ...prev,
+      [currentSlide.captionId]: voteValue,
+    }));
+
     try {
-      // Use hydrated user state for debug info
-      const currentUserId = user?.id || null;
-      
       // Ensure voteValue is always 1 or -1
       const voteValueNumber: 1 | -1 = voteValue === 1 ? 1 : -1;
       const requestBody = {
@@ -541,56 +491,38 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
         voteValue: voteValueNumber,
       };
 
-      // Update debug info before vote
-      setVoteDebugInfo({
-        userId: currentUserId,
-        captionId: currentSlide.captionId,
-        voteValue: voteValueNumber,
-        lastStatus: null,
-        lastErrorMessage: null,
-        lastRequestBody: requestBody,
-        lastResponse: null,
-        authLoaded: authLoaded,
-      });
-
       // Call the authenticated API route
-      const response = await fetch('/api/vote', {
+      const voteUrl = '/api/vote';
+      const response = await fetch(voteUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),
       });
 
-      let result;
+      // Capture response text before parsing JSON
+      const responseText = await response.text();
+      let responseJson = null;
       try {
-        result = await response.json();
+        responseJson = JSON.parse(responseText);
       } catch (jsonError) {
         console.error('[MemeDeck] Failed to parse response JSON:', jsonError);
-        const errorText = await response.text();
-        result = { success: false, error: `Invalid JSON response: ${errorText}` };
+        responseJson = { success: false, error: `Invalid JSON response: ${responseText}` };
       }
 
-      // Update debug info with response
-      const errorMessage = result.error || (response.ok ? null : `HTTP ${response.status}`);
-      setVoteDebugInfo(prev => ({
-        ...prev,
-        lastStatus: response.status,
-        lastErrorMessage: errorMessage,
-        lastResponse: result,
-        authLoaded: authLoaded,
-      }));
-
-      // Debug logging (dev only)
+      // Debug logging (console only)
       if (process.env.NODE_ENV === 'development') {
         console.log('[MemeDeck] VOTE API RESPONSE', { 
+          url: voteUrl,
           status: response.status, 
           ok: response.ok, 
-          result,
           requestBody,
+          responseText,
+          responseJson,
         });
       }
 
-      if (!response.ok || !result.success) {
-        const errorMsg = result.error || `HTTP ${response.status}: Failed to save vote`;
+      if (!response.ok || !responseJson?.success) {
+        const errorMsg = responseJson?.error || `HTTP ${response.status}: Failed to save vote`;
         const displayError = `Vote failed: ${errorMsg}`;
         setVoteError(displayError);
         setToast({ 
@@ -601,39 +533,22 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
           setToast(null);
           setVoteError(null);
         }, 3000);
+
+        // Revert optimistic update on error
+        setUserVotes(prev => ({
+          ...prev,
+          ...(previousVote === undefined
+            ? (() => {
+                const { [currentSlide.captionId]: _removed, ...rest } = prev;
+                return rest;
+              })()
+            : { [currentSlide.captionId]: previousVote }),
+        }));
         setIsVoting(false);
         return;
       }
 
-      // PART 3: Update votesByCaptionId immediately for UI consistency
-      // This ensures Previous/Next immediately shows the correct message without needing a reload
-      setUserVotes(prev => ({
-        ...prev,
-        [currentSlide.captionId]: voteValue,
-      }));
-      
-      console.log('[MemeDeck] DEBUG - Vote updated for caption:', currentSlide.captionId, 'vote:', voteValue);
-
-      // Optional: Refetch that one row to confirm it was saved
-      if (process.env.NODE_ENV === 'development') {
-        try {
-          const supabase = createClient();
-          const { data: verifyData, error: verifyError } = await supabase
-            .from('caption_votes')
-            .select('caption_id, vote_value')
-            .eq('profile_id', user?.id)
-            .eq('caption_id', currentSlide.captionId)
-            .single();
-          
-          if (verifyError) {
-            console.warn('[MemeDeck] DEBUG - Vote verification failed:', verifyError);
-          } else {
-            console.log('[MemeDeck] DEBUG - Vote verified in DB:', verifyData);
-          }
-        } catch (verifyErr) {
-          console.warn('[MemeDeck] DEBUG - Vote verification error:', verifyErr);
-        }
-      }
+      console.log('[MemeDeck] DEBUG - Vote saved for caption:', currentSlide.captionId, 'savedRow:', responseJson?.savedRow);
 
       // Show toast with success confirmation
       // Note: We've already updated userVotes state above, so the vote is confirmed
@@ -657,16 +572,18 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
     } catch (err) {
       console.error('[MemeDeck] Error voting:', err);
       const errorMessage = err instanceof Error ? err.message : 'Failed to save vote';
-      
-      // Update debug info with error
-      setVoteDebugInfo(prev => ({
+
+      // Revert optimistic update on network error
+      setUserVotes(prev => ({
         ...prev,
-        lastStatus: null,
-        lastErrorMessage: errorMessage,
-        lastResponse: { success: false, error: errorMessage },
-        authLoaded: authLoaded,
+        ...(previousVote === undefined
+          ? (() => {
+              const { [currentSlide.captionId]: _removed, ...rest } = prev;
+              return rest;
+            })()
+          : { [currentSlide.captionId]: previousVote }),
       }));
-      
+
       setVoteError(`Vote failed: ${errorMessage}`);
       setToast({ 
         message: 'Failed to save vote', 
@@ -938,61 +855,6 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
                 </div>
               )}
 
-              {/* Debug Panel - Dev Only */}
-              {process.env.NODE_ENV === 'development' && (
-                <div className="mt-4 text-xs bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 px-3 py-2 rounded-lg"
-                     style={{ fontFamily: 'var(--font-poppins)', fontWeight: 400 }}>
-                  <div className="font-semibold mb-1 text-gray-700 dark:text-gray-300">Debug Info:</div>
-                  <div className="space-y-1 text-gray-600 dark:text-gray-400">
-                    <div>Auth Loaded: <span className={`font-mono ${authLoaded ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>{authLoaded ? '✅ Yes' : '❌ No'}</span></div>
-                    <div>User ID: <span className="font-mono text-[10px]">{user?.id || voteDebugInfo.userId || 'null'}</span></div>
-                    <div className="mt-2 pt-2 border-t border-gray-300 dark:border-gray-600">
-                      <div className="text-[10px] font-semibold">Last Request:</div>
-                      {voteDebugInfo.lastRequestBody ? (
-                        <>
-                          <div className="text-[10px] ml-2">Caption ID: <span className="font-mono">{voteDebugInfo.lastRequestBody.captionId || 'null'}</span></div>
-                          <div className="text-[10px] ml-2">Vote Value: <span className="font-mono">{voteDebugInfo.lastRequestBody.voteValue !== null ? voteDebugInfo.lastRequestBody.voteValue : 'null'}</span></div>
-                        </>
-                      ) : (
-                        <div className="text-[10px] ml-2 text-gray-400">—</div>
-                      )}
-                    </div>
-                    <div className="mt-2 pt-2 border-t border-gray-300 dark:border-gray-600">
-                      <div className="text-[10px] font-semibold">Last Response:</div>
-                      <div className="text-[10px] ml-2">Status: <span className={`font-mono ${voteDebugInfo.lastStatus ? (voteDebugInfo.lastStatus >= 200 && voteDebugInfo.lastStatus < 300 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400') : 'text-gray-400'}`}>{voteDebugInfo.lastStatus || '—'}</span></div>
-                      {voteDebugInfo.lastErrorMessage && (
-                        <div className="text-[10px] ml-2 text-red-600 dark:text-red-400">Error: <span className="font-mono">{voteDebugInfo.lastErrorMessage}</span></div>
-                      )}
-                      {voteDebugInfo.lastResponse && (
-                        <div className="text-[10px] ml-2">Success: <span className={`font-mono ${voteDebugInfo.lastResponse.success ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>{voteDebugInfo.lastResponse.success ? '✅ Yes' : '❌ No'}</span></div>
-                      )}
-                    </div>
-                    <div className="mt-2 pt-2 border-t border-gray-300 dark:border-gray-600">
-                      <div className="text-[10px]">Current State:</div>
-                      <div className="text-[10px] ml-2">Caption ID: <span className="font-mono">{currentSlide?.captionId || 'null'}</span></div>
-                      <div className="text-[10px] ml-2">My Vote: <span className="font-mono">{myVote !== undefined ? myVote : 'null'}</span></div>
-                      <div className="text-[10px] ml-2">Votes in State: <span className="font-mono">{Object.keys(userVotes).length}</span></div>
-                    </div>
-                    {voteDebugInfo.lastResponse?.voteHydration && (
-                      <div className="mt-2 pt-2 border-t border-gray-300 dark:border-gray-600">
-                        <div className="text-[10px]">Vote Hydration:</div>
-                        <div className="text-[10px] ml-2">Caption IDs: {voteDebugInfo.lastResponse.voteHydration.captionIdsRequested}</div>
-                        <div className="text-[10px] ml-2">Votes Fetched: {voteDebugInfo.lastResponse.voteHydration.votesFetched}</div>
-                      </div>
-                    )}
-                    {!authLoaded && (
-                      <div className="mt-2 text-yellow-600 dark:text-yellow-400 text-[10px]">
-                        ⚠️ Auth not loaded - voting disabled
-                      </div>
-                    )}
-                    {authLoaded && !user && (
-                      <div className="mt-2 text-orange-600 dark:text-orange-400 text-[10px]">
-                        ⚠️ Not signed in - voting disabled
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
             </div>
           </div>
         </div>
