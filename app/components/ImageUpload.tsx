@@ -186,9 +186,9 @@ export default function ImageUpload({ onSuccess }: ImageUploadProps) {
         }
       }
 
-      // Revalidate and navigate to deck
+      // Revalidate and navigate to home (Meme TV deck)
       await revalidateHome();
-      router.push('/deck');
+      router.push('/');
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : 'Failed to save selection';
       setError(errorMessage);

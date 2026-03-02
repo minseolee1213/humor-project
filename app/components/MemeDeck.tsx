@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import type { User } from '@supabase/supabase-js';
 import StatsHUD from './StatsHUD';
 
 interface Image {
@@ -34,6 +35,29 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
   const [isVoting, setIsVoting] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: 'like' | 'dislike' } | null>(null);
   const [clickedButton, setClickedButton] = useState<'like' | 'dislike' | null>(null);
+  const [voteError, setVoteError] = useState<string | null>(null);
+  const [voteLoadError, setVoteLoadError] = useState<string | null>(null);
+  const [voteDebugInfo, setVoteDebugInfo] = useState<{
+    userId: string | null;
+    captionId: string | null;
+    voteValue: number | null;
+    lastResponse: { 
+      success: boolean; 
+      error?: string; 
+      vote?: any;
+      voteHydration?: {
+        captionIdsRequested: number;
+        votesFetched: number;
+      };
+    } | null;
+    authLoaded: boolean;
+  }>({
+    userId: null,
+    captionId: null,
+    voteValue: null,
+    lastResponse: null,
+    authLoaded: false,
+  });
   const [hasMore, setHasMore] = useState(true);
   const [currentPage, setCurrentPage] = useState(0);
   const [profileId, setProfileId] = useState<string | null>(null);
@@ -45,6 +69,40 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
   } | null>(null);
   const deckRef = useRef<HTMLDivElement>(null);
   const isRestoringIndexRef = useRef(false);
+
+  // Auth state hydration - robust client-side auth state management
+  const [user, setUser] = useState<User | null>(null);
+  const [authLoaded, setAuthLoaded] = useState(false);
+  const supabase = createClient();
+
+  // Hydrate auth state on mount and subscribe to changes
+  useEffect(() => {
+    let ignore = false;
+
+    async function loadAuth() {
+      const { data, error } = await supabase.auth.getUser();
+      if (!ignore) {
+        setUser(data.user ?? null);
+        setAuthLoaded(true);
+        console.log('[MemeDeck] Auth loaded:', { userId: data.user?.id || null, error });
+      }
+    }
+
+    loadAuth();
+
+    const { data: subscription } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!ignore) {
+        setUser(session?.user ?? null);
+        setAuthLoaded(true);
+        console.log('[MemeDeck] Auth state changed:', { userId: session?.user?.id || null, event: _event });
+      }
+    });
+
+    return () => {
+      ignore = true;
+      subscription.subscription.unsubscribe();
+    };
+  }, [supabase]);
 
   // PART A: Persist currentIndex to localStorage whenever it changes
   useEffect(() => {
@@ -76,16 +134,22 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
 
   // Load user votes for captions and merge into votesByCaptionId
   // Supports pagination by merging new votes with existing ones
-  const loadUserVotesForCaptions = useCallback(async (captionIds: string[], userProfileId: string) => {
-    if (!userProfileId || captionIds.length === 0) {
-      console.log('[MemeDeck] DEBUG - Skipping vote fetch: no profileId or no captionIds');
+  const loadUserVotesForCaptions = useCallback(async (captionIds: string[], userProfileId: string | null) => {
+    if (captionIds.length === 0) {
+      console.log('[MemeDeck] DEBUG - Skipping vote fetch: no captionIds');
+      return;
+    }
+
+    if (!userProfileId) {
+      console.log('[MemeDeck] DEBUG - No userProfileId, skipping vote fetch');
+      setUserVotes({});
       return;
     }
 
     try {
       const supabase = createClient();
 
-      console.log('[MemeDeck] DEBUG - Fetching votes for', captionIds.length, 'captions');
+      console.log('[MemeDeck] DEBUG - Fetching votes for', captionIds.length, 'captions (profileId:', userProfileId, ')');
 
       const { data, error } = await supabase
         .from('caption_votes')
@@ -95,8 +159,34 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
 
       if (error) {
         console.error('[MemeDeck] Error fetching votes:', error);
+        // Check for RLS errors
+        if (error.code === 'PGRST301' || error.message?.includes('RLS') || error.message?.includes('permission') || error.message?.includes('policy')) {
+          const errorMsg = "Votes can't be loaded (RLS)";
+          setVoteLoadError(process.env.NODE_ENV === 'development' ? `${errorMsg}: ${error.message}` : errorMsg);
+        } else {
+          // Clear any previous RLS error if it's a different error
+          setVoteLoadError(null);
+        }
+        
+        // Update debug info with error
+        if (process.env.NODE_ENV === 'development') {
+          setVoteDebugInfo(prev => ({
+            ...prev,
+            lastResponse: {
+              success: false,
+              error: error.message,
+              voteHydration: {
+                captionIdsRequested: captionIds.length,
+                votesFetched: 0,
+              },
+            },
+          }));
+        }
         return;
       }
+      
+      // Clear RLS error on successful load
+      setVoteLoadError(null);
 
       if (data && data.length > 0) {
         // Build new votes map from fetched data
@@ -115,9 +205,40 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
         
         // DEBUG: Log votes loaded
         const votesLoadedCount = Object.keys(newVotes).length;
-        console.log('[MemeDeck] DEBUG - Votes loaded:', votesLoadedCount, 'out of', captionIds.length, 'captions');
+        console.log('[MemeDeck] DEBUG - Vote hydration:', {
+          captionIdsRequested: captionIds.length,
+          votesFetched: votesLoadedCount,
+          captionIds: captionIds.slice(0, 5), // Show first 5 for debugging
+          votes: Object.keys(newVotes).slice(0, 5),
+        });
+        
+        // Update debug info with vote hydration stats
+        if (process.env.NODE_ENV === 'development') {
+          setVoteDebugInfo(prev => ({
+            ...prev,
+            lastResponse: {
+              success: true,
+              voteHydration: {
+                captionIdsRequested: captionIds.length,
+                votesFetched: votesLoadedCount,
+              },
+            },
+          }));
+        }
       } else {
         console.log('[MemeDeck] DEBUG - No votes found for', captionIds.length, 'captions');
+        if (process.env.NODE_ENV === 'development') {
+          setVoteDebugInfo(prev => ({
+            ...prev,
+            lastResponse: {
+              success: true,
+              voteHydration: {
+                captionIdsRequested: captionIds.length,
+                votesFetched: 0,
+              },
+            },
+          }));
+        }
       }
     } catch (err) {
       console.error('[MemeDeck] Error fetching user votes:', err);
@@ -125,16 +246,6 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
   }, []);
 
   // Legacy function for backward compatibility (now uses merge logic)
-  // Note: The new useEffect will also load votes, so this is mainly for immediate loading during fetchSlides
-  const fetchUserVotesForSlides = useCallback(async (slidesData: Slide[], userProfileId: string) => {
-    if (!userProfileId || slidesData.length === 0) {
-      return 0;
-    }
-    const captionIds = slidesData.map(s => s.captionId);
-    await loadUserVotesForCaptions(captionIds, userProfileId);
-    // Return approximate count (exact count not critical, merge handles duplicates)
-    return captionIds.length;
-  }, [loadUserVotesForCaptions]);
 
   // Fetch slides (captions with images)
   useEffect(() => {
@@ -234,9 +345,7 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
             setCurrentIndex(restoredIndex);
             isRestoringIndexRef.current = false;
             
-            // PART B: Load user votes
-            const votesLoadedCount = await fetchUserVotesForSlides(slidesData, userProfileId);
-            console.log('[MemeDeck] DEBUG - votesLoadedCount:', votesLoadedCount);
+            // Note: Votes will be loaded when auth is ready (see useEffect below)
           }
         } else {
           // Logged out: start at index 0
@@ -251,40 +360,42 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
     };
 
     fetchSlides();
-  }, [userId, fetchUserVotesForSlides, currentPage]);
+  }, [userId, currentPage, getProfileId]);
 
-  // Load user votes whenever slides change (hydration on mount + pagination support)
+  // Load user votes when auth is loaded AND user exists AND slides are loaded
   // This ensures votes persist across refresh and handles pagination
   useEffect(() => {
     const loadVotes = async () => {
-      // Only load votes if user is logged in and we have slides
-      if (!userId || slides.length === 0) {
-        // If logged out, clear votes
-        if (!userId) {
-          setUserVotes({});
+      // Wait for auth to be loaded
+      if (!authLoaded) {
+        console.log('[MemeDeck] DEBUG - Auth not loaded yet, skipping vote fetch');
+        return;
+      }
+
+      // Only load votes if we have slides and a user
+      if (slides.length === 0) {
+        if (!user) {
+          setUserVotes({}); // Clear votes if logged out
         }
         return;
       }
 
-      // Get profileId
-      const userProfileId = await getProfileId();
-      if (!userProfileId) {
-        console.log('[MemeDeck] DEBUG - No profileId, skipping vote load');
+      if (!user) {
+        console.log('[MemeDeck] DEBUG - No user, clearing votes');
+        setUserVotes({});
         return;
       }
 
       // Extract all caption IDs from current slides
       const captionIds = slides.map(s => s.captionId);
       
-      // Fetch votes for all current captions
-      // The loadUserVotesForCaptions function will merge with existing votes
-      // (won't overwrite, so safe to call even if some votes already loaded)
-      console.log('[MemeDeck] DEBUG - Loading votes for', captionIds.length, 'captions');
-      await loadUserVotesForCaptions(captionIds, userProfileId);
+      // Fetch votes for all current captions using hydrated user ID
+      console.log('[MemeDeck] DEBUG - Loading votes for', captionIds.length, 'captions (user:', user.id, ')');
+      await loadUserVotesForCaptions(captionIds, user.id);
     };
 
     loadVotes();
-  }, [slides, userId, getProfileId, loadUserVotesForCaptions]);
+  }, [slides, authLoaded, user, loadUserVotesForCaptions]);
 
   // Refresh slides when refreshTrigger changes (e.g., after upload)
   useEffect(() => {
@@ -343,11 +454,11 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
                 range: '0-999'
               });
             }
-            if (userId && slidesData.length > 0) {
+            // Note: Votes will be loaded when auth is ready (see useEffect above)
+            if (user && slidesData.length > 0) {
               const userProfileId = await getProfileId();
               if (userProfileId) {
                 setProfileId(userProfileId);
-                await fetchUserVotesForSlides(slidesData, userProfileId);
                 
                 // Restore saved index after refresh
                 const storageKey = `memeDeckIndex:${userProfileId}`;
@@ -368,14 +479,29 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
 
       fetchSlides();
     }
-  }, [refreshTrigger, userId, fetchUserVotesForSlides]);
+  }, [refreshTrigger, user]);
 
   // Handle vote
   const handleVote = useCallback(async (voteValue: 1 | -1) => {
-    // Check if logged in
-    if (!userId) {
+    // Gate voting until auth is loaded
+    if (!authLoaded) {
+      setVoteError('Loading session...');
+      setToast({ message: 'Loading session...', type: voteValue === 1 ? 'like' : 'dislike' });
+      setTimeout(() => {
+        setToast(null);
+        setVoteError(null);
+      }, 2000);
+      return;
+    }
+
+    // Check if logged in (use hydrated user state)
+    if (!user) {
+      setVoteError('Please sign in to vote');
       setToast({ message: 'Please sign in to vote', type: voteValue === 1 ? 'like' : 'dislike' });
-      setTimeout(() => setToast(null), 3000);
+      setTimeout(() => {
+        setToast(null);
+        setVoteError(null);
+      }, 3000);
       return;
     }
 
@@ -385,7 +511,10 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
     }
 
     const currentSlide = slides[currentIndex];
-    if (!currentSlide) return;
+    if (!currentSlide || !currentSlide.captionId) {
+      setVoteError('Error: caption is null');
+      return;
+    }
 
     // Trigger click animation
     setClickedButton(voteValue === 1 ? 'like' : 'dislike');
@@ -393,60 +522,63 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
 
     setIsVoting(true);
     setToast(null);
+    setVoteError(null);
 
     try {
-      const supabase = createClient();
-      
-      // Get current user session
-      const { data: { user }, error: authError } = await supabase.auth.getUser();
-      
-      if (authError || !user) {
-        setToast({ message: 'Please sign in to vote', type: voteValue === 1 ? 'like' : 'dislike' });
-        setTimeout(() => setToast(null), 3000);
+      // Use hydrated user state for debug info
+      const currentUserId = user?.id || null;
+
+      // Update debug info before vote
+      setVoteDebugInfo({
+        userId: currentUserId,
+        captionId: currentSlide.captionId,
+        voteValue: voteValue,
+        lastResponse: null,
+        authLoaded: authLoaded,
+      });
+
+      // Call the authenticated API route
+      const response = await fetch('/api/vote', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          captionId: currentSlide.captionId,
+          voteValue: voteValue,
+        }),
+      });
+
+      const result = await response.json();
+
+      // Update debug info with response
+      setVoteDebugInfo(prev => ({
+        ...prev,
+        lastResponse: result,
+        authLoaded: authLoaded,
+      }));
+
+      // Debug logging (dev only)
+      if (process.env.NODE_ENV === 'development') {
+        console.log('[MemeDeck] VOTE API RESPONSE', { 
+          status: response.status, 
+          ok: response.ok, 
+          result 
+        });
+      }
+
+      if (!response.ok || !result.success) {
+        const errorMsg = result.error || 'Failed to save vote';
+        const displayError = `Vote failed: ${errorMsg}`;
+        setVoteError(displayError);
+        setToast({ 
+          message: errorMsg, 
+          type: voteValue === 1 ? 'like' : 'dislike' 
+        });
+        setTimeout(() => {
+          setToast(null);
+          setVoteError(null);
+        }, 3000);
         setIsVoting(false);
         return;
-      }
-
-      // Resolve profile_id (use cached if available)
-      let userProfileId = profileId;
-      if (!userProfileId) {
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('id')
-          .eq('id', user.id)
-          .single();
-        
-        userProfileId = profile?.id || user.id;
-        setProfileId(userProfileId);
-      }
-
-      // Check if existing vote exists to preserve created_datetime_utc
-      const { data: existingVote } = await supabase
-        .from('caption_votes')
-        .select('created_datetime_utc')
-        .eq('profile_id', userProfileId)
-        .eq('caption_id', currentSlide.captionId)
-        .single();
-
-      const nowIso = new Date().toISOString();
-      
-      const voteData = {
-        caption_id: currentSlide.captionId,
-        profile_id: userProfileId,
-        vote_value: voteValue,
-        created_datetime_utc: existingVote?.created_datetime_utc || nowIso,
-        modified_datetime_utc: nowIso,
-      };
-
-      // Upsert vote
-      const { error: voteError } = await supabase
-        .from('caption_votes')
-        .upsert(voteData, {
-          onConflict: 'profile_id,caption_id',
-        });
-
-      if (voteError) {
-        throw voteError;
       }
 
       // PART 3: Update votesByCaptionId immediately for UI consistency
@@ -458,9 +590,31 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
       
       console.log('[MemeDeck] DEBUG - Vote updated for caption:', currentSlide.captionId, 'vote:', voteValue);
 
-      // Show toast
+      // Optional: Refetch that one row to confirm it was saved
+      if (process.env.NODE_ENV === 'development') {
+        try {
+          const supabase = createClient();
+          const { data: verifyData, error: verifyError } = await supabase
+            .from('caption_votes')
+            .select('caption_id, vote_value')
+            .eq('profile_id', user?.id)
+            .eq('caption_id', currentSlide.captionId)
+            .single();
+          
+          if (verifyError) {
+            console.warn('[MemeDeck] DEBUG - Vote verification failed:', verifyError);
+          } else {
+            console.log('[MemeDeck] DEBUG - Vote verified in DB:', verifyData);
+          }
+        } catch (verifyErr) {
+          console.warn('[MemeDeck] DEBUG - Vote verification error:', verifyErr);
+        }
+      }
+
+      // Show toast with success confirmation
+      // Note: We've already updated userVotes state above, so the vote is confirmed
       setToast({ 
-        message: voteValue === 1 ? 'Liked' : 'Disliked', 
+        message: 'Saved ✅', 
         type: voteValue === 1 ? 'like' : 'dislike' 
       });
 
@@ -477,16 +631,21 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
       }, 300);
 
     } catch (err) {
-      console.error('Error voting:', err);
+      console.error('[MemeDeck] Error voting:', err);
+      const errorMessage = err instanceof Error ? err.message : 'Failed to save vote';
+      setVoteError(`Vote failed: ${errorMessage}`);
       setToast({ 
         message: 'Failed to save vote', 
         type: voteValue === 1 ? 'like' : 'dislike' 
       });
-      setTimeout(() => setToast(null), 3000);
+      setTimeout(() => {
+        setToast(null);
+        setVoteError(null);
+      }, 3000);
     } finally {
       setIsVoting(false);
     }
-  }, [userId, slides, currentIndex, isVoting]);
+  }, [authLoaded, user, slides, currentIndex, isVoting, profileId]);
 
   // Keyboard shortcuts: ArrowUp = Like, ArrowDown = Dislike
   useEffect(() => {
@@ -590,6 +749,17 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
         isLoggedIn={userId !== null}
       />
       
+      {/* Vote Load Error (RLS) - Dev only or small message */}
+      {voteLoadError && (
+        <div className={`fixed top-20 right-4 z-50 px-3 py-2 rounded-lg ${
+          process.env.NODE_ENV === 'development' 
+            ? 'bg-yellow-500/20 border border-yellow-500/30 text-yellow-200 text-xs' 
+            : 'bg-red-500/20 border border-red-500/30 text-red-200 text-xs'
+        }`} style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}>
+          {voteLoadError}
+        </div>
+      )}
+      
       {/* Centered Container */}
       <div className="max-w-[1000px] mx-auto px-4 sm:px-8 mb-8 w-full">
         {/* Two Column Layout: TV Left, Remote Right - Vertically Centered */}
@@ -677,9 +847,9 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
               {/* Like Button */}
               <button
                 onClick={() => handleVote(1)}
-                disabled={isVoting}
+                disabled={isVoting || !authLoaded}
                 className={`remote-vote-button remote-button-like ${
-                  isVoting
+                  isVoting || !authLoaded
                     ? 'remote-button-disabled'
                     : myVote === 1
                     ? 'remote-button-active'
@@ -698,9 +868,9 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
               {/* Dislike Button */}
               <button
                 onClick={() => handleVote(-1)}
-                disabled={isVoting}
+                disabled={isVoting || !authLoaded}
                 className={`remote-vote-button remote-button-dislike ${
-                  isVoting
+                  isVoting || !authLoaded
                     ? 'remote-button-disabled'
                     : myVote === -1
                     ? 'remote-button-active'
@@ -715,6 +885,60 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
                 </span>
                 <span className="remote-button-label">DISLIKE</span>
               </button>
+
+              {/* Vote Status Message */}
+              {myVote !== undefined && currentSlide && (
+                <div className={`mt-3 px-3 py-1.5 rounded-lg text-xs text-center ${
+                  myVote === 1 
+                    ? 'bg-green-500/20 border border-green-500/30 text-green-200' 
+                    : 'bg-red-500/20 border border-red-500/30 text-red-200'
+                }`} style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}>
+                  {myVote === 1 ? 'You liked this caption' : 'You disliked this caption'}
+                </div>
+              )}
+
+              {/* Vote Error Display */}
+              {voteError && (
+                <div className="mt-2 px-3 py-1.5 rounded-lg bg-red-500/20 border border-red-500/30 text-red-200 text-xs text-center" style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}>
+                  {voteError}
+                </div>
+              )}
+
+              {/* Debug Panel - Dev Only */}
+              {process.env.NODE_ENV === 'development' && (
+                <div className="mt-4 text-xs bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 px-3 py-2 rounded-lg"
+                     style={{ fontFamily: 'var(--font-poppins)', fontWeight: 400 }}>
+                  <div className="font-semibold mb-1 text-gray-700 dark:text-gray-300">Debug Info:</div>
+                  <div className="space-y-1 text-gray-600 dark:text-gray-400">
+                    <div>Auth Loaded: <span className={`font-mono ${authLoaded ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>{authLoaded ? '✅ Yes' : '❌ No'}</span></div>
+                    <div>User ID: <span className="font-mono text-[10px]">{user?.id || voteDebugInfo.userId || 'null'}</span></div>
+                    <div>Caption ID: <span className="font-mono text-[10px]">{voteDebugInfo.captionId || currentSlide?.captionId || 'null'}</span></div>
+                    <div>Vote Value: <span className="font-mono">{voteDebugInfo.voteValue !== null ? voteDebugInfo.voteValue : (myVote !== undefined ? myVote : 'null')}</span></div>
+                    <div>Votes in State: <span className="font-mono">{Object.keys(userVotes).length}</span></div>
+                    {voteDebugInfo.lastResponse?.voteHydration && (
+                      <div className="mt-2 pt-2 border-t border-gray-300 dark:border-gray-600">
+                        <div className="text-[10px]">Vote Hydration:</div>
+                        <div className="text-[10px] ml-2">Caption IDs: {voteDebugInfo.lastResponse.voteHydration.captionIdsRequested}</div>
+                        <div className="text-[10px] ml-2">Votes Fetched: {voteDebugInfo.lastResponse.voteHydration.votesFetched}</div>
+                      </div>
+                    )}
+                    <div className="mt-2">
+                      Last Response:
+                      {voteDebugInfo.lastResponse ? (
+                        <div className="ml-2 mt-1">
+                          {voteDebugInfo.lastResponse.success ? (
+                            <span className="text-green-600 dark:text-green-400">✅ Success</span>
+                          ) : (
+                            <span className="text-red-600 dark:text-red-400">❌ {voteDebugInfo.lastResponse.error || 'Unknown error'}</span>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="ml-2 text-gray-400">—</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>

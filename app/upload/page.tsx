@@ -22,7 +22,7 @@ export default async function UploadPage() {
           <h1 className="text-4xl font-bold text-foreground">Upload Image</h1>
           <div className="flex items-center gap-4">
             <a
-              href="/deck"
+              href="/"
               className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
             >
               Meme TV
