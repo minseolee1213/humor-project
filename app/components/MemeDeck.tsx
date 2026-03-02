@@ -1,0 +1,786 @@
+'use client';
+
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { createClient } from '@/lib/supabase/client';
+import StatsHUD from './StatsHUD';
+
+interface Image {
+  id: string;
+  url: string | null;
+  image_description: string | null;
+}
+
+interface Slide {
+  captionId: string;
+  captionText: string | null;
+  imageUrl: string | null;
+  imageDescription: string | null;
+}
+
+interface MemeDeckProps {
+  userId: string | null;
+  refreshTrigger?: number; // Optional: increment to trigger refresh
+}
+
+const CAPTIONS_PER_PAGE = 1000; // Load up to 1000 captions for testing (was 100)
+
+export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
+  const [slides, setSlides] = useState<Slide[]>([]);
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [slideDirection, setSlideDirection] = useState<'left' | 'right' | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [userVotes, setUserVotes] = useState<Record<string, number>>({});
+  const [isVoting, setIsVoting] = useState(false);
+  const [toast, setToast] = useState<{ message: string; type: 'like' | 'dislike' } | null>(null);
+  const [clickedButton, setClickedButton] = useState<'like' | 'dislike' | null>(null);
+  const [hasMore, setHasMore] = useState(true);
+  const [currentPage, setCurrentPage] = useState(0);
+  const [profileId, setProfileId] = useState<string | null>(null);
+  const [debugInfo, setDebugInfo] = useState<{
+    totalAvailable: number;
+    returned: number;
+    filters: string;
+    range: string;
+  } | null>(null);
+  const deckRef = useRef<HTMLDivElement>(null);
+  const isRestoringIndexRef = useRef(false);
+
+  // PART A: Persist currentIndex to localStorage whenever it changes
+  useEffect(() => {
+    // Skip persistence during initial restore
+    if (isRestoringIndexRef.current || !profileId) return;
+
+    const storageKey = `memeDeckIndex:${profileId}`;
+    localStorage.setItem(storageKey, String(currentIndex));
+  }, [currentIndex, profileId]);
+
+  // Get profileId for persistence
+  const getProfileId = useCallback(async (): Promise<string | null> => {
+    if (!userId) return null;
+
+    try {
+      const supabase = createClient();
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('id', userId)
+        .single();
+      
+      return profile?.id || userId;
+    } catch (err) {
+      console.error('Error getting profileId:', err);
+      return userId; // Fallback to userId
+    }
+  }, [userId]);
+
+  // Load user votes for captions and merge into votesByCaptionId
+  // Supports pagination by merging new votes with existing ones
+  const loadUserVotesForCaptions = useCallback(async (captionIds: string[], userProfileId: string) => {
+    if (!userProfileId || captionIds.length === 0) {
+      console.log('[MemeDeck] DEBUG - Skipping vote fetch: no profileId or no captionIds');
+      return;
+    }
+
+    try {
+      const supabase = createClient();
+
+      console.log('[MemeDeck] DEBUG - Fetching votes for', captionIds.length, 'captions');
+
+      const { data, error } = await supabase
+        .from('caption_votes')
+        .select('caption_id, vote_value')
+        .eq('profile_id', userProfileId)
+        .in('caption_id', captionIds);
+
+      if (error) {
+        console.error('[MemeDeck] Error fetching votes:', error);
+        return;
+      }
+
+      if (data && data.length > 0) {
+        // Build new votes map from fetched data
+        const newVotes: Record<string, 1 | -1> = {};
+        data.forEach((vote) => {
+          if (vote.vote_value === 1 || vote.vote_value === -1) {
+            newVotes[vote.caption_id] = vote.vote_value as 1 | -1;
+          }
+        });
+        
+        // Merge new votes with existing votes (pagination support)
+        setUserVotes(prev => ({
+          ...prev,
+          ...newVotes
+        }));
+        
+        // DEBUG: Log votes loaded
+        const votesLoadedCount = Object.keys(newVotes).length;
+        console.log('[MemeDeck] DEBUG - Votes loaded:', votesLoadedCount, 'out of', captionIds.length, 'captions');
+      } else {
+        console.log('[MemeDeck] DEBUG - No votes found for', captionIds.length, 'captions');
+      }
+    } catch (err) {
+      console.error('[MemeDeck] Error fetching user votes:', err);
+    }
+  }, []);
+
+  // Legacy function for backward compatibility (now uses merge logic)
+  // Note: The new useEffect will also load votes, so this is mainly for immediate loading during fetchSlides
+  const fetchUserVotesForSlides = useCallback(async (slidesData: Slide[], userProfileId: string) => {
+    if (!userProfileId || slidesData.length === 0) {
+      return 0;
+    }
+    const captionIds = slidesData.map(s => s.captionId);
+    await loadUserVotesForCaptions(captionIds, userProfileId);
+    // Return approximate count (exact count not critical, merge handles duplicates)
+    return captionIds.length;
+  }, [loadUserVotesForCaptions]);
+
+  // Fetch slides (captions with images)
+  useEffect(() => {
+    const fetchSlides = async () => {
+      try {
+        setIsLoading(true);
+        const supabase = createClient();
+        
+        // Fetch captions with images using INNER JOIN
+        // Filter by image visibility (is_public OR is_common_use) using foreignTable filter
+        // This ensures pagination applies to captions, not images
+        const { data, error: fetchError, count } = await supabase
+          .from('captions')
+          .select(`
+            id,
+            content,
+            image_id,
+            created_datetime_utc,
+            images!inner (
+              id,
+              url,
+              image_description,
+              is_public,
+              is_common_use
+            )
+          `, { count: 'exact' })
+          .or('is_public.eq.true,is_common_use.eq.true', { foreignTable: 'images' })
+          .order('created_datetime_utc', { ascending: false })
+          .range(0, 999); // Fetch up to 1000 captions
+
+        // DEBUG: Log total count and returned data
+        console.log('[MemeDeck] DEBUG - Total captions available (count):', count);
+        console.log('[MemeDeck] DEBUG - Captions returned this fetch (data.length):', data?.length || 0);
+        console.log('[MemeDeck] DEBUG - Applied filters: images.is_public = true OR images.is_common_use = true (foreignTable)');
+        console.log('[MemeDeck] DEBUG - Range: 0-999');
+
+        if (fetchError) {
+          console.error('Error fetching slides:', fetchError);
+          setError('Failed to load memes');
+          return;
+        }
+
+        if (!data || data.length === 0) {
+          setError('No memes found');
+          return;
+        }
+
+        // Transform relational data
+        // Filter out captions with no content and ensure we have valid captionId
+        const slidesData: Slide[] = (data || [])
+          .filter((caption: any) => caption.id && caption.content) // Only include captions with content
+          .map((caption: any) => {
+            const image = Array.isArray(caption.images) 
+              ? (caption.images[0] || null)
+              : (caption.images || null);
+            
+            return {
+              captionId: caption.id,
+              captionText: caption.content,
+              imageUrl: image?.url || null,
+              imageDescription: image?.image_description || null,
+            };
+          });
+
+        console.log('[MemeDeck] Slides created:', slidesData.length);
+        
+        // DEBUG: Set debug info in state for UI display
+        // Count is for THIS filtered query (captions with public/common images), not total captions in table
+        const totalCount = count !== null && count !== undefined ? count : 0;
+        setDebugInfo({
+          totalAvailable: totalCount,
+          returned: slidesData.length,
+          filters: 'images.is_public = true OR images.is_common_use = true (foreignTable)',
+          range: '0-999'
+        });
+        
+        setSlides(slidesData);
+        
+        // Get profileId and restore saved index + load votes
+        if (userId && slidesData.length > 0) {
+          const userProfileId = await getProfileId();
+          if (userProfileId) {
+            setProfileId(userProfileId);
+            
+            // PART A: Restore saved slide index
+            const storageKey = `memeDeckIndex:${userProfileId}`;
+            const savedIndexStr = localStorage.getItem(storageKey);
+            const savedIndex = savedIndexStr ? parseInt(savedIndexStr, 10) : 0;
+            const restoredIndex = Math.max(0, Math.min(savedIndex, slidesData.length - 1));
+            
+            // DEBUG: Log persistence restore
+            console.log('[MemeDeck] DEBUG - profileId:', userProfileId);
+            console.log('[MemeDeck] DEBUG - savedIndex:', savedIndex);
+            console.log('[MemeDeck] DEBUG - restoredIndex:', restoredIndex);
+            
+            isRestoringIndexRef.current = true;
+            setCurrentIndex(restoredIndex);
+            isRestoringIndexRef.current = false;
+            
+            // PART B: Load user votes
+            const votesLoadedCount = await fetchUserVotesForSlides(slidesData, userProfileId);
+            console.log('[MemeDeck] DEBUG - votesLoadedCount:', votesLoadedCount);
+          }
+        } else {
+          // Logged out: start at index 0
+          setCurrentIndex(0);
+        }
+      } catch (err) {
+        console.error('Error in fetchSlides:', err);
+        setError('Failed to load memes');
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    fetchSlides();
+  }, [userId, fetchUserVotesForSlides, currentPage]);
+
+  // Load user votes whenever slides change (hydration on mount + pagination support)
+  // This ensures votes persist across refresh and handles pagination
+  useEffect(() => {
+    const loadVotes = async () => {
+      // Only load votes if user is logged in and we have slides
+      if (!userId || slides.length === 0) {
+        // If logged out, clear votes
+        if (!userId) {
+          setUserVotes({});
+        }
+        return;
+      }
+
+      // Get profileId
+      const userProfileId = await getProfileId();
+      if (!userProfileId) {
+        console.log('[MemeDeck] DEBUG - No profileId, skipping vote load');
+        return;
+      }
+
+      // Extract all caption IDs from current slides
+      const captionIds = slides.map(s => s.captionId);
+      
+      // Fetch votes for all current captions
+      // The loadUserVotesForCaptions function will merge with existing votes
+      // (won't overwrite, so safe to call even if some votes already loaded)
+      console.log('[MemeDeck] DEBUG - Loading votes for', captionIds.length, 'captions');
+      await loadUserVotesForCaptions(captionIds, userProfileId);
+    };
+
+    loadVotes();
+  }, [slides, userId, getProfileId, loadUserVotesForCaptions]);
+
+  // Refresh slides when refreshTrigger changes (e.g., after upload)
+  useEffect(() => {
+    if (refreshTrigger && refreshTrigger > 0) {
+      const fetchSlides = async () => {
+        try {
+          const supabase = createClient();
+          
+          const { data, error: fetchError, count: refreshCount } = await supabase
+            .from('captions')
+            .select(`
+              id,
+              content,
+              image_id,
+              created_datetime_utc,
+              images!inner (
+                id,
+                url,
+                image_description,
+                is_public,
+                is_common_use
+              )
+            `, { count: 'exact' })
+            .or('is_public.eq.true,is_common_use.eq.true', { foreignTable: 'images' })
+            .order('created_datetime_utc', { ascending: false })
+            .range(0, 999); // Fetch up to 1000 captions
+
+          console.log('[MemeDeck] DEBUG (refresh) - Total captions available (count):', refreshCount);
+          console.log('[MemeDeck] DEBUG (refresh) - Captions returned this fetch (data.length):', data?.length || 0);
+          console.log('[MemeDeck] DEBUG (refresh) - Applied filters: images.is_public = true OR images.is_common_use = true (foreignTable)');
+
+          if (!fetchError && data) {
+            const slidesData: Slide[] = (data || [])
+              .filter((caption: any) => caption.id && caption.content)
+              .map((caption: any) => {
+                const image = Array.isArray(caption.images) 
+                  ? (caption.images[0] || null)
+                  : (caption.images || null);
+                
+                return {
+                  captionId: caption.id,
+                  captionText: caption.content,
+                  imageUrl: image?.url || null,
+                  imageDescription: image?.image_description || null,
+                };
+              });
+
+            setSlides(slidesData);
+            setHasMore(slidesData.length === CAPTIONS_PER_PAGE);
+            setCurrentPage(0); // Reset to first page on refresh
+            if (refreshCount !== null && refreshCount !== undefined) {
+              setDebugInfo({
+                totalAvailable: refreshCount,
+                returned: slidesData.length,
+                filters: 'images.is_public = true OR images.is_common_use = true (foreignTable)',
+                range: '0-999'
+              });
+            }
+            if (userId && slidesData.length > 0) {
+              const userProfileId = await getProfileId();
+              if (userProfileId) {
+                setProfileId(userProfileId);
+                await fetchUserVotesForSlides(slidesData, userProfileId);
+                
+                // Restore saved index after refresh
+                const storageKey = `memeDeckIndex:${userProfileId}`;
+                const savedIndexStr = localStorage.getItem(storageKey);
+                const savedIndex = savedIndexStr ? parseInt(savedIndexStr, 10) : 0;
+                const restoredIndex = Math.max(0, Math.min(savedIndex, slidesData.length - 1));
+                
+                isRestoringIndexRef.current = true;
+                setCurrentIndex(restoredIndex);
+                isRestoringIndexRef.current = false;
+              }
+            }
+          }
+        } catch (err) {
+          console.error('Error refreshing slides:', err);
+        }
+      };
+
+      fetchSlides();
+    }
+  }, [refreshTrigger, userId, fetchUserVotesForSlides]);
+
+  // Handle vote
+  const handleVote = useCallback(async (voteValue: 1 | -1) => {
+    // Check if logged in
+    if (!userId) {
+      setToast({ message: 'Please sign in to vote', type: voteValue === 1 ? 'like' : 'dislike' });
+      setTimeout(() => setToast(null), 3000);
+      return;
+    }
+
+    // Prevent double-clicks
+    if (isVoting) {
+      return;
+    }
+
+    const currentSlide = slides[currentIndex];
+    if (!currentSlide) return;
+
+    // Trigger click animation
+    setClickedButton(voteValue === 1 ? 'like' : 'dislike');
+    setTimeout(() => setClickedButton(null), 200);
+
+    setIsVoting(true);
+    setToast(null);
+
+    try {
+      const supabase = createClient();
+      
+      // Get current user session
+      const { data: { user }, error: authError } = await supabase.auth.getUser();
+      
+      if (authError || !user) {
+        setToast({ message: 'Please sign in to vote', type: voteValue === 1 ? 'like' : 'dislike' });
+        setTimeout(() => setToast(null), 3000);
+        setIsVoting(false);
+        return;
+      }
+
+      // Resolve profile_id (use cached if available)
+      let userProfileId = profileId;
+      if (!userProfileId) {
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('id')
+          .eq('id', user.id)
+          .single();
+        
+        userProfileId = profile?.id || user.id;
+        setProfileId(userProfileId);
+      }
+
+      // Check if existing vote exists to preserve created_datetime_utc
+      const { data: existingVote } = await supabase
+        .from('caption_votes')
+        .select('created_datetime_utc')
+        .eq('profile_id', userProfileId)
+        .eq('caption_id', currentSlide.captionId)
+        .single();
+
+      const nowIso = new Date().toISOString();
+      
+      const voteData = {
+        caption_id: currentSlide.captionId,
+        profile_id: userProfileId,
+        vote_value: voteValue,
+        created_datetime_utc: existingVote?.created_datetime_utc || nowIso,
+        modified_datetime_utc: nowIso,
+      };
+
+      // Upsert vote
+      const { error: voteError } = await supabase
+        .from('caption_votes')
+        .upsert(voteData, {
+          onConflict: 'profile_id,caption_id',
+        });
+
+      if (voteError) {
+        throw voteError;
+      }
+
+      // PART 3: Update votesByCaptionId immediately for UI consistency
+      // This ensures Previous/Next immediately shows the correct message without needing a reload
+      setUserVotes(prev => ({
+        ...prev,
+        [currentSlide.captionId]: voteValue,
+      }));
+      
+      console.log('[MemeDeck] DEBUG - Vote updated for caption:', currentSlide.captionId, 'vote:', voteValue);
+
+      // Show toast
+      setToast({ 
+        message: voteValue === 1 ? 'Liked' : 'Disliked', 
+        type: voteValue === 1 ? 'like' : 'dislike' 
+      });
+
+      // Auto-advance to next slide
+      setTimeout(() => {
+        if (currentIndex < slides.length - 1) {
+          setSlideDirection('left');
+          setCurrentIndex(prev => prev + 1);
+        } else {
+          // Reached end - could loop or show message
+          setToast({ message: 'You\'ve reached the end!', type: 'like' });
+        }
+        setToast(null);
+      }, 300);
+
+    } catch (err) {
+      console.error('Error voting:', err);
+      setToast({ 
+        message: 'Failed to save vote', 
+        type: voteValue === 1 ? 'like' : 'dislike' 
+      });
+      setTimeout(() => setToast(null), 3000);
+    } finally {
+      setIsVoting(false);
+    }
+  }, [userId, slides, currentIndex, isVoting]);
+
+  // Keyboard shortcuts: ArrowUp = Like, ArrowDown = Dislike
+  useEffect(() => {
+    const handleKeyPress = (event: KeyboardEvent) => {
+      // Ignore if key is repeating (held down)
+      if (event.repeat) return;
+
+      // Ignore if user is typing in an input field
+      const target = event.target as HTMLElement;
+      if (
+        target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable
+      ) {
+        return;
+      }
+
+      // Ignore if voting is in progress or loading
+      if (isVoting || isLoading) return;
+
+      // ArrowUp triggers LIKE (vote_value = 1)
+      if (event.key === 'ArrowUp') {
+        event.preventDefault(); // Prevent page scroll
+        handleVote(1);
+      }
+      // ArrowDown triggers DISLIKE (vote_value = -1)
+      else if (event.key === 'ArrowDown') {
+        event.preventDefault(); // Prevent page scroll
+        handleVote(-1);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyPress);
+    // Cleanup: Remove event listener on unmount
+    return () => {
+      window.removeEventListener('keydown', handleKeyPress);
+    };
+  }, [handleVote, isVoting, isLoading]);
+
+  // Manual navigation
+  const goToPrevious = () => {
+    if (currentIndex > 0 && !isVoting) {
+      setSlideDirection('right');
+      setCurrentIndex(prev => prev - 1);
+    }
+  };
+
+  const goToNext = () => {
+    if (currentIndex < slides.length - 1 && !isVoting) {
+      setSlideDirection('left');
+      setCurrentIndex(prev => prev + 1);
+    }
+  };
+
+  const currentSlide = slides[currentIndex];
+  // PART 2: Get vote for current caption from votesByCaptionId lookup map
+  // myVote will be 1 (liked), -1 (disliked), or undefined (never voted)
+  const myVote: 1 | -1 | undefined = currentSlide ? (userVotes[currentSlide.captionId] as 1 | -1 | undefined) : undefined;
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <div className="text-center">
+          <p className="text-lg text-foreground/70">Loading memes...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <div className="text-center">
+          <p className="text-lg text-red-600 dark:text-red-400">{error}</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (slides.length === 0) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <div className="text-center">
+          <p className="text-lg text-foreground/70">No memes found</p>
+          <p className="text-sm text-foreground/50 mt-2">
+            Upload some images to generate captions!
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const progressPercentage = slides.length > 0 ? ((currentIndex + 1) / slides.length) * 100 : 0;
+
+  return (
+    <div ref={deckRef} className="flex flex-col items-center justify-center min-h-[60vh]">
+      {/* Stats HUD - Top Right */}
+      <StatsHUD 
+        userVotes={userVotes} 
+        totalCount={slides.length} 
+        isLoggedIn={userId !== null}
+      />
+      
+      {/* Centered Container */}
+      <div className="max-w-[1000px] mx-auto px-4 sm:px-8 mb-8 w-full">
+        {/* Two Column Layout: TV Left, Remote Right - Vertically Centered */}
+        <div className="flex flex-col lg:flex-row items-center justify-center gap-6 lg:gap-8">
+          {/* LEFT: TV Component */}
+          <div className="w-full">
+            <div
+              key={currentIndex}
+              className={`bg-[#fafafa] dark:bg-gray-800 rounded-[20px] shadow-[0_10px_30px_rgba(0,0,0,0.08)] border border-gray-200/50 dark:border-gray-700/50 overflow-hidden transition-transform duration-300 ${
+                slideDirection === 'left' ? 'slide-animation-left' : slideDirection === 'right' ? 'slide-animation-right' : ''
+              }`}
+              onAnimationEnd={() => setSlideDirection(null)}
+            >
+              {/* TV Container with Antennas */}
+              <div className="tv-container">
+                {/* Antennas */}
+                <div className="tv-antennas">
+                  <div className="tv-antenna-left"></div>
+                  <div className="tv-antenna-right"></div>
+                </div>
+
+                {/* TV Frame */}
+                <div className="tv-frame mx-auto mt-6 mb-0">
+                  {/* Channel Indicator */}
+                  <div className="tv-channel-indicator">
+                    <span>CH {String(currentIndex + 1).padStart(2, '0')}</span>
+                    <span>{currentIndex + 1} / {slides.length}</span>
+                  </div>
+
+                  {/* TV Screen */}
+                  <div className="tv-screen">
+                    {currentSlide.imageUrl ? (
+                      <img
+                        key={currentSlide.captionId}
+                        src={currentSlide.imageUrl}
+                        alt={currentSlide.imageDescription || 'Meme'}
+                        className="w-full h-auto max-h-[320px] sm:max-h-[420px] object-cover rounded-2xl relative z-0"
+                        style={{ animation: 'fadeIn 0.3s ease-in' }}
+                      />
+                    ) : (
+                      <div className="w-full h-[320px] sm:h-[420px] flex items-center justify-center text-gray-400 rounded-2xl">
+                        No image
+                      </div>
+                    )}
+                    {/* Power Light */}
+                    <div className="tv-power-light"></div>
+                    {/* Speaker Grill */}
+                    <div className="tv-speaker-grill">
+                      {[...Array(5)].map((_, i) => (
+                        <div key={i} className="tv-speaker-dot"></div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Speech Bubble Caption */}
+                <div className="speech-bubble mx-6">
+                  <p className="text-[1.4rem] font-semibold text-foreground text-center leading-[1.5]" style={{ fontFamily: 'var(--font-fredoka)', fontWeight: 600 }}>
+                    {currentSlide.captionText || 'No caption'}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* RIGHT: Remote Control */}
+          <div className="w-full lg:w-auto flex justify-center">
+            <div className="remote-control">
+              {/* IR Sensor */}
+              <div className="remote-ir-sensor"></div>
+
+              {/* Speaker Holes */}
+              <div className="remote-speaker-holes">
+                {[...Array(8)].map((_, i) => (
+                  <div key={i} className="remote-speaker-hole"></div>
+                ))}
+              </div>
+
+              {/* Decorative D-Pad */}
+              <div className="remote-dpad">
+                <div className="remote-dpad-outer"></div>
+                <div className="remote-dpad-inner"></div>
+              </div>
+
+              {/* Like Button */}
+              <button
+                onClick={() => handleVote(1)}
+                disabled={isVoting}
+                className={`remote-vote-button remote-button-like ${
+                  isVoting
+                    ? 'remote-button-disabled'
+                    : myVote === 1
+                    ? 'remote-button-active'
+                    : ''
+                }`}
+                style={{
+                  fontFamily: 'var(--font-poppins)',
+                }}
+              >
+                <span className={`remote-button-icon transition-transform duration-150 ${clickedButton === 'like' ? 'scale-110' : ''}`}>
+                  ▲
+                </span>
+                <span className="remote-button-label">LIKE</span>
+              </button>
+
+              {/* Dislike Button */}
+              <button
+                onClick={() => handleVote(-1)}
+                disabled={isVoting}
+                className={`remote-vote-button remote-button-dislike ${
+                  isVoting
+                    ? 'remote-button-disabled'
+                    : myVote === -1
+                    ? 'remote-button-active'
+                    : ''
+                }`}
+                style={{
+                  fontFamily: 'var(--font-poppins)',
+                }}
+              >
+                <span className={`remote-button-icon transition-transform duration-150 ${clickedButton === 'dislike' ? 'scale-110' : ''}`}>
+                  ▼
+                </span>
+                <span className="remote-button-label">DISLIKE</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Manual Navigation Arrows */}
+      <div className="flex gap-4 items-center">
+        <button
+          onClick={goToPrevious}
+          disabled={currentIndex === 0 || isVoting}
+          className={`px-4 py-2 rounded-lg transition-colors ${
+            currentIndex === 0 || isVoting
+              ? 'bg-gray-300 dark:bg-gray-700 text-gray-500 dark:text-gray-400 cursor-not-allowed'
+              : 'bg-gray-600 hover:bg-gray-700 text-white'
+          }`}
+          style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}
+        >
+          ← Previous
+        </button>
+        <button
+          onClick={goToNext}
+          disabled={currentIndex === slides.length - 1 || isVoting}
+          className={`px-4 py-2 rounded-lg transition-colors ${
+            currentIndex === slides.length - 1 || isVoting
+              ? 'bg-gray-300 dark:bg-gray-700 text-gray-500 dark:text-gray-400 cursor-not-allowed'
+              : 'bg-gray-600 hover:bg-gray-700 text-white'
+          }`}
+          style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}
+        >
+          Next →
+        </button>
+      </div>
+
+      {/* Toast Notification */}
+      {toast && (
+        <div
+          className={`fixed top-4 left-1/2 transform -translate-x-1/2 px-6 py-3 rounded-lg shadow-lg z-50 transition-all ${
+            toast.type === 'like'
+              ? 'bg-green-600 text-white'
+              : 'bg-red-600 text-white'
+          }`}
+          style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}
+        >
+          {toast.message}
+        </div>
+      )}
+
+
+      {/* Upload CTA */}
+      <div className="mt-12 flex justify-center">
+        <div className="bg-white dark:bg-gray-800 rounded-[20px] shadow-[0_10px_30px_rgba(0,0,0,0.08)] border border-gray-200/50 dark:border-gray-700/50 p-8 max-w-md w-full text-center">
+          <h2 className="text-2xl font-bold text-foreground mb-2" style={{ fontFamily: 'var(--font-fredoka)', fontWeight: 600 }}>
+            Upload a Meme
+          </h2>
+          <p className="text-sm text-foreground/60 mb-6" style={{ fontFamily: 'var(--font-poppins)', fontWeight: 400 }}>
+            Add your own image and generate captions.
+          </p>
+          <a
+            href="/upload"
+            className="inline-block px-8 py-3 rounded-2xl font-semibold text-white bg-blue-600 hover:bg-blue-700 transition-colors shadow-lg hover:shadow-xl"
+            style={{ fontFamily: 'var(--font-poppins)', fontWeight: 600 }}
+          >
+            Upload Photo
+          </a>
+        </div>
+      </div>
+    </div>
+  );
+}

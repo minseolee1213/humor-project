@@ -1,6 +1,7 @@
 import { createClient } from '@/lib/supabase/server';
 import { redirect } from 'next/navigation';
 import SignOutButton from '@/app/SignOutButton';
+import ImageUpload from '@/app/components/ImageUpload';
 
 // Force dynamic rendering since we use cookies for auth
 export const dynamic = 'force-dynamic';
@@ -20,6 +21,12 @@ export default async function UploadPage() {
         <div className="flex justify-between items-center mb-8">
           <h1 className="text-4xl font-bold text-foreground">Upload Image</h1>
           <div className="flex items-center gap-4">
+            <a
+              href="/deck"
+              className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
+            >
+              Meme TV
+            </a>
             <span className="text-sm text-foreground/70">
               {user.email}
             </span>
@@ -28,12 +35,16 @@ export default async function UploadPage() {
         </div>
         
         <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-8">
-          <p className="text-lg text-foreground/70 mb-4">
-            This is a protected route. Only authenticated users can access this page.
-          </p>
-          <p className="text-sm text-foreground/50">
-            Upload functionality can be added here.
-          </p>
+          <div className="mb-6">
+            <h2 className="text-2xl font-semibold text-foreground mb-2">
+              Upload & Generate Captions
+            </h2>
+            <p className="text-sm text-foreground/60">
+              Upload an image to automatically generate captions using AI. Supported formats: JPEG, PNG, WebP, GIF, HEIC
+            </p>
+          </div>
+          
+          <ImageUpload />
         </div>
       </div>
     </main>

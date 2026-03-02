@@ -1,7 +1,8 @@
 import { createClient } from '@/lib/supabase/server';
+import { revalidatePath } from 'next/cache';
 import SignInButton from '@/app/SignInButton';
 import SignOutButton from '@/app/SignOutButton';
-import ImageVoteButtons from '@/app/components/ImageVoteButtons';
+import CaptionCard from '@/app/components/CaptionCard';
 
 // Force dynamic rendering since we use cookies for auth
 export const dynamic = 'force-dynamic';
@@ -18,47 +19,188 @@ interface Image {
   celebrity_recognition: string | null;
 }
 
-async function getImages(): Promise<Image[]> {
+interface Caption {
+  id: string;
+  content: string | null;
+  image_id: string | null;
+  profile_id: string | null;
+  created_datetime_utc: string;
+  is_public: boolean;
+  like_count: number;
+  images?: Image | null;
+}
+
+interface CaptionWithImage {
+  id: string;
+  content: string | null;
+  image_id: string | null;
+  profile_id: string | null;
+  created_datetime_utc: string;
+  is_public: boolean;
+  like_count: number;
+  image: Image | null;
+}
+
+/**
+ * Fetch captions with their associated images
+ * Uses relational select to join captions with images
+ */
+async function getCaptionsWithImages(): Promise<CaptionWithImage[]> {
   try {
     const supabase = await createClient();
+    
+    // Try relational select first
+    // Load 100 captions at a time (range 0-99)
+    // Note: More captions appear as more images are uploaded and processed
     const { data, error } = await supabase
-      .from('images')
-      .select('*')
+      .from('captions')
+      .select(`
+        id,
+        content,
+        image_id,
+        profile_id,
+        created_datetime_utc,
+        is_public,
+        like_count,
+        images (
+          id,
+          url,
+          image_description,
+          created_datetime_utc,
+          modified_datetime_utc,
+          is_public,
+          is_common_use,
+          additional_context,
+          celebrity_recognition
+        )
+      `)
       .eq('is_public', true)
       .order('created_datetime_utc', { ascending: false });
+      // No limit - load all captions (Supabase default limit is 1000, adjust if needed)
+
+    // Dev logging: count of captions returned
+    console.log('[Gallery] Captions fetched:', data?.length || 0);
 
     if (error) {
-      console.error('Error fetching images:', error);
-      console.error('Error details:', {
-        message: error.message,
-        code: error.code,
-        details: error.details,
-        hint: error.hint
-      });
+      console.error('Error fetching captions with images (relational):', error);
       
-      // If filtering by is_public fails, try without filter (might be RLS issue)
-      if (error.code === '42501' || error.message.includes('policy')) {
-        console.log('Trying to fetch all images without filter...');
-        const supabase = await createClient();
-        const { data: allData, error: allError } = await supabase
-          .from('images')
-          .select('*')
-          .order('created_datetime_utc', { ascending: false });
-        
-        if (allError) {
-          console.error('Error fetching all images:', allError);
-          return [];
-        }
-        return allData || [];
-      }
+      // Fallback: fetch captions and images separately, then merge
+      return await getCaptionsWithImagesFallback();
+    }
+
+    // Transform the data to flatten the structure
+    const captionsWithImages: CaptionWithImage[] = (data || []).map((caption: any) => ({
+      id: caption.id,
+      content: caption.content,
+      image_id: caption.image_id,
+      profile_id: caption.profile_id,
+      created_datetime_utc: caption.created_datetime_utc,
+      is_public: caption.is_public,
+      like_count: caption.like_count,
+      image: Array.isArray(caption.images) 
+        ? (caption.images[0] || null)
+        : (caption.images || null),
+    }));
+
+    return captionsWithImages;
+  } catch (error) {
+    console.error('Error in getCaptionsWithImages:', error);
+    return [];
+  }
+}
+
+/**
+ * Fallback: Fetch captions and images separately, then merge
+ */
+async function getCaptionsWithImagesFallback(): Promise<CaptionWithImage[]> {
+  try {
+    const supabase = await createClient();
+    
+    // Fetch captions
+    const { data: captions, error: captionsError } = await supabase
+      .from('captions')
+      .select('id, content, image_id, profile_id, created_datetime_utc, is_public, like_count')
+      .eq('is_public', true)
+      .order('created_datetime_utc', { ascending: false });
+      // No limit - load all captions (Supabase default limit is 1000, adjust if needed)
+
+    // Dev logging: count of captions returned
+    console.log('[Gallery] Captions fetched (fallback):', captions?.length || 0);
+
+    if (captionsError) {
+      console.error('Error fetching captions:', captionsError);
       return [];
     }
 
-    console.log(`Successfully fetched ${data?.length || 0} images`);
-    return data || [];
+    if (!captions || captions.length === 0) {
+      return [];
+    }
+
+    // Get unique image IDs
+    const imageIds = [...new Set(captions.map(c => c.image_id).filter(Boolean))] as string[];
+
+    if (imageIds.length === 0) {
+      return captions.map(c => ({ ...c, image: null }));
+    }
+
+    // Fetch images
+    const { data: images, error: imagesError } = await supabase
+      .from('images')
+      .select('id, url, image_description, created_datetime_utc, modified_datetime_utc, is_public, is_common_use, additional_context, celebrity_recognition')
+      .in('id', imageIds);
+
+    if (imagesError) {
+      console.error('Error fetching images:', imagesError);
+      return captions.map(c => ({ ...c, image: null }));
+    }
+
+    // Create image map
+    const imageMap = new Map<string, Image>();
+    (images || []).forEach(img => {
+      imageMap.set(img.id, img);
+    });
+
+    // Merge captions with images
+    return captions.map(caption => ({
+      ...caption,
+      image: caption.image_id ? (imageMap.get(caption.image_id) || null) : null,
+    }));
   } catch (error) {
-    console.error('Error in getImages:', error);
+    console.error('Error in getCaptionsWithImagesFallback:', error);
     return [];
+  }
+}
+
+async function getUserVotes(profileId: string, captionIds: string[]): Promise<Record<string, number>> {
+  if (!profileId || captionIds.length === 0) {
+    return {};
+  }
+
+  try {
+    const supabase = await createClient();
+    const { data, error } = await supabase
+      .from('caption_votes')
+      .select('caption_id, vote_value')
+      .eq('profile_id', profileId)
+      .in('caption_id', captionIds);
+
+    if (error) {
+      console.error('Error fetching user votes:', error);
+      return {};
+    }
+
+    // Build map: caption_id -> vote_value
+    const votesMap: Record<string, number> = {};
+    if (data) {
+      data.forEach((vote) => {
+        votesMap[vote.caption_id] = vote.vote_value;
+      });
+    }
+
+    return votesMap;
+  } catch (error) {
+    console.error('Error in getUserVotes:', error);
+    return {};
   }
 }
 
@@ -91,13 +233,32 @@ export default async function Home() {
     );
   }
 
-  // User is authenticated, fetch and show images
-  let images: Image[] = [];
+  // User is authenticated, fetch captions with images
+  let captionsWithImages: CaptionWithImage[] = [];
+  let userVotes: Record<string, number> = {};
   
   try {
-    images = await getImages();
+    captionsWithImages = await getCaptionsWithImages();
+    
+    // Fetch user votes for all captions
+    if (captionsWithImages.length > 0) {
+      let profileId: string | null = null;
+      const supabase = await createClient();
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('id', user.id)
+        .single();
+      
+      profileId = profile?.id || user.id;
+      
+      if (profileId) {
+        const captionIds = captionsWithImages.map(c => c.id);
+        userVotes = await getUserVotes(profileId, captionIds);
+      }
+    }
   } catch (error) {
-    console.error('Error loading images:', error);
+    console.error('Error loading captions:', error);
   }
 
   return (
@@ -106,6 +267,12 @@ export default async function Home() {
         <div className="flex justify-between items-center mb-8">
           <h1 className="text-4xl font-bold text-foreground">Rate Captions</h1>
           <div className="flex items-center gap-4">
+            <a
+              href="/deck"
+              className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
+            >
+              Deck
+            </a>
             <a
               href="/upload"
               className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
@@ -119,85 +286,41 @@ export default async function Home() {
           </div>
         </div>
         
-        {images.length === 0 ? (
+        {captionsWithImages.length === 0 ? (
           <div className="text-center py-12">
-            <p className="text-lg text-foreground/70 mb-4">No images found</p>
+            <p className="text-lg text-foreground/70 mb-4">No captions found</p>
             <div className="text-sm text-foreground/50 space-y-2">
               <p>Possible reasons:</p>
               <ul className="list-disc list-inside space-y-1">
-                <li>The images table is empty</li>
+                <li>The captions table is empty</li>
                 <li>Row Level Security (RLS) policies are blocking access</li>
                 <li>Check the browser console for connection errors</li>
               </ul>
               <p className="mt-4 text-xs">
-                Check your Supabase dashboard → Table Editor → images to verify data exists
+                Upload an image to generate captions!
               </p>
             </div>
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
-            {images.map((image) => (
-              <div
-                key={image.id}
-                className="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden hover:shadow-lg transition-shadow duration-300"
-              >
-                <div className="aspect-square bg-gray-100 dark:bg-gray-700 overflow-hidden">
-                  {image.url ? (
-                    <img
-                      src={image.url}
-                      alt={image.image_description || 'Image'}
-                      className="w-full h-full object-cover"
-                    />
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center text-gray-400">
-                      No image
-                    </div>
-                  )}
-                </div>
-                <div className="p-4">
-                  {image.image_description && (
-                    <p className="text-sm text-foreground/70 line-clamp-2 mb-2">
-                      {image.image_description}
-                    </p>
-                  )}
-                  {image.additional_context && (
-                    <p className="text-xs text-foreground/60 line-clamp-1 mb-1">
-                      {image.additional_context}
-                    </p>
-                  )}
-                  {image.celebrity_recognition && (
-                    <p className="text-xs text-blue-600 dark:text-blue-400 mb-1">
-                      👤 {image.celebrity_recognition}
-                    </p>
-                  )}
-                  <div className="flex gap-2 mt-2">
-                    {image.is_public && (
-                      <span className="text-xs px-2 py-1 bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 rounded">
-                        Public
-                      </span>
-                    )}
-                    {image.is_common_use && (
-                      <span className="text-xs px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 rounded">
-                        Common Use
-                      </span>
-                    )}
-                  </div>
-                  <p className="text-xs text-foreground/50 mt-2">
-                    {new Date(image.created_datetime_utc).toLocaleDateString()}
-                  </p>
-                  
-                  {/* Vote Buttons Section - Always rendered */}
-                  <div className="mt-4 pt-3 border-t border-gray-200 dark:border-gray-700">
-                    <ImageVoteButtons
-                      key={`vote-${image.id}`}
-                      captionId={null}
-                      isAuthenticated={!!user}
-                      currentVote={null}
-                    />
-                  </div>
-                </div>
-              </div>
-            ))}
+            {captionsWithImages.map((caption) => {
+              // Get user's vote from caption_votes table (filtered by profile_id)
+              // This is separate from like_count which comes from captions table
+              const currentVote = userVotes[caption.id] || null;
+
+              return (
+                <CaptionCard
+                  key={caption.id}
+                  captionId={caption.id}
+                  content={caption.content}
+                  image={caption.image}
+                  initialLikeCount={caption.like_count}
+                  initialUserVote={currentVote}
+                  isAuthenticated={!!user}
+                  createdDatetimeUtc={caption.created_datetime_utc}
+                />
+              );
+            })}
           </div>
         )}
       </div>

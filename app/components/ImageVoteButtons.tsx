@@ -8,12 +8,14 @@ interface ImageVoteButtonsProps {
   captionId: string | null; // null if no caption exists for this image
   isAuthenticated: boolean;
   currentVote?: number | null; // 1 for upvote, -1 for downvote, null/undefined for no vote
+  onVoteSuccess?: (voteValue: number) => void; // Callback when vote succeeds
 }
 
 function ImageVoteButtons({ 
   captionId, 
   isAuthenticated,
-  currentVote
+  currentVote,
+  onVoteSuccess
 }: ImageVoteButtonsProps) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -30,10 +32,10 @@ function ImageVoteButtons({
   }, [captionId]);
 
   const handleVote = async (voteType: 'up' | 'down') => {
-    // IMMEDIATELY clear all messages - do this first
-    setSuccess(null);
-    setError(null);
-    setIsLoading(false);
+    // GUARD: Prevent double-clicks and multiple simultaneous requests
+    if (isLoading) {
+      return;
+    }
 
     // Early return guard: Check if user is logged in
     if (!isAuthenticated) {
@@ -58,6 +60,7 @@ function ImageVoteButtons({
     }
 
     // Both conditions met: user is logged in AND caption exists
+    // Set loading state IMMEDIATELY to prevent double-clicks
     setIsLoading(true);
     setError(null);
     setSuccess(null);
@@ -69,6 +72,7 @@ function ImageVoteButtons({
       const { data: { user }, error: authError } = await supabase.auth.getUser();
       
       if (authError || !user) {
+        setIsLoading(false);
         setError('Session not recognized on server—please sign in again.');
         setSuccess(null);
         setTimeout(() => {
@@ -149,6 +153,13 @@ function ImageVoteButtons({
 
       // Success!
       setSuccess('Vote submitted successfully!');
+      
+      // Call callback to update parent component's optimistic state
+      if (onVoteSuccess) {
+        onVoteSuccess(voteValue);
+      }
+      
+      // Refresh to sync with database (DB trigger updates like_count)
       router.refresh();
 
       setTimeout(() => {
@@ -168,6 +179,8 @@ function ImageVoteButtons({
     }
   };
 
+  // Highlight based ONLY on user's vote from caption_votes table
+  // currentVote comes from: SELECT vote_value FROM caption_votes WHERE profile_id = user AND caption_id = this
   const isUpvoted = currentVote === 1;
   const isDownvoted = currentVote === -1;
 
