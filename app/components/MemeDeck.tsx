@@ -2,8 +2,9 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import { shuffle } from '@/lib/shuffle';
 import type { User } from '@supabase/supabase-js';
-import StatsHUD from './StatsHUD';
+import PreviewRail from './PreviewRail';
 
 interface Image {
   id: string;
@@ -52,6 +53,7 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
   // Auth state hydration - robust client-side auth state management
   const [user, setUser] = useState<User | null>(null);
   const [authLoaded, setAuthLoaded] = useState(false);
+  const [votesHydrated, setVotesHydrated] = useState(false);
   const supabase = createClient();
 
   // Hydrate auth state on mount and subscribe to changes
@@ -83,13 +85,20 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
     };
   }, [supabase]);
 
+  const getIndexStorageKey = (id: string) => `memeDeckIndex:${id}`;
+  const getOrderStorageKey = (id: string) => `memeDeckOrder:${id}`;
+
   // PART A: Persist currentIndex to localStorage whenever it changes
   useEffect(() => {
     // Skip persistence during initial restore
     if (isRestoringIndexRef.current || !profileId) return;
 
-    const storageKey = `memeDeckIndex:${profileId}`;
-    localStorage.setItem(storageKey, String(currentIndex));
+    const storageKey = getIndexStorageKey(profileId);
+    try {
+      localStorage.setItem(storageKey, String(currentIndex));
+    } catch (err) {
+      console.error('[MemeDeck] Failed to persist index', err);
+    }
   }, [currentIndex, profileId]);
 
   // Get profileId for persistence
@@ -192,8 +201,13 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
           ...aggregatedVotes,
         }));
       }
+      
+      // Mark votes as hydrated after loading completes (even if no votes found)
+      setVotesHydrated(true);
     } catch (err) {
       console.error('[MemeDeck] Error fetching user votes:', err);
+      // Still mark as hydrated even on error to avoid blocking shuffle forever
+      setVotesHydrated(true);
     }
   }, []);
 
@@ -273,36 +287,66 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
           filters: 'images.is_public = true OR images.is_common_use = true (foreignTable)',
           range: '0-999'
         });
-        
-        setSlides(slidesData);
-        
-        // Get profileId and restore saved index + load votes
+
+        let finalSlides = slidesData;
+
+        // Get profileId and restore saved order + index
         if (userId && slidesData.length > 0) {
           const userProfileId = await getProfileId();
           if (userProfileId) {
             setProfileId(userProfileId);
-            
-            // PART A: Restore saved slide index
-            const storageKey = `memeDeckIndex:${userProfileId}`;
-            const savedIndexStr = localStorage.getItem(storageKey);
+
+            try {
+              const orderKey = getOrderStorageKey(userProfileId);
+              const storedOrderStr = localStorage.getItem(orderKey);
+              if (storedOrderStr) {
+                const storedIds: string[] = JSON.parse(storedOrderStr);
+                const byId = new Map(slidesData.map((s) => [s.captionId, s]));
+                const orderedSlides: Slide[] = [];
+
+                storedIds.forEach((id) => {
+                  const slide = byId.get(id);
+                  if (slide) {
+                    orderedSlides.push(slide);
+                    byId.delete(id);
+                  }
+                });
+
+                // Append any new slides not in stored order
+                byId.forEach((slide) => {
+                  orderedSlides.push(slide);
+                });
+
+                if (orderedSlides.length === slidesData.length) {
+                  finalSlides = orderedSlides;
+                }
+              }
+            } catch (e) {
+              console.error('[MemeDeck] Failed to restore memeDeckOrder', e);
+            }
+
+            // Restore saved slide index (relative to finalSlides order)
+            const indexKey = getIndexStorageKey(userProfileId);
+            const savedIndexStr = localStorage.getItem(indexKey);
             const savedIndex = savedIndexStr ? parseInt(savedIndexStr, 10) : 0;
-            const restoredIndex = Math.max(0, Math.min(savedIndex, slidesData.length - 1));
-            
-            // DEBUG: Log persistence restore
-            console.log('[MemeDeck] DEBUG - profileId:', userProfileId);
-            console.log('[MemeDeck] DEBUG - savedIndex:', savedIndex);
-            console.log('[MemeDeck] DEBUG - restoredIndex:', restoredIndex);
-            
+            const restoredIndex = Math.max(0, Math.min(savedIndex, finalSlides.length - 1));
+
+            console.log('[MemeDeck] DEBUG - persistence restore', {
+              profileId: userProfileId,
+              savedIndex,
+              restoredIndex,
+            });
+
             isRestoringIndexRef.current = true;
             setCurrentIndex(restoredIndex);
             isRestoringIndexRef.current = false;
-            
-            // Note: Votes will be loaded when auth is ready (see useEffect below)
           }
         } else {
           // Logged out: start at index 0
           setCurrentIndex(0);
         }
+
+        setSlides(finalSlides);
       } catch (err) {
         console.error('Error in fetchSlides:', err);
         setError('Failed to load memes');
@@ -328,6 +372,7 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
       if (slides.length === 0) {
         if (!user) {
           setUserVotes({}); // Clear votes if logged out
+          setVotesHydrated(true); // Mark as hydrated even if no slides
         }
         return;
       }
@@ -335,8 +380,12 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
       if (!user) {
         console.log('[MemeDeck] DEBUG - No user, clearing votes');
         setUserVotes({});
+        setVotesHydrated(true); // Mark as hydrated when logged out
         return;
       }
+      
+      // Reset hydration status when starting a new vote load
+      setVotesHydrated(false);
 
       // Extract all caption IDs from current slides
       const captionIds = slides.map(s => s.captionId);
@@ -355,7 +404,7 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
       const fetchSlides = async () => {
         try {
           const supabase = createClient();
-          
+
           const { data, error: fetchError, count: refreshCount } = await supabase
             .from('captions')
             .select(`
@@ -395,33 +444,64 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
                 };
               });
 
-            setSlides(slidesData);
-            setHasMore(slidesData.length === CAPTIONS_PER_PAGE);
-            setCurrentPage(0); // Reset to first page on refresh
-            if (refreshCount !== null && refreshCount !== undefined) {
-              setDebugInfo({
-                totalAvailable: refreshCount,
-                returned: slidesData.length,
-                filters: 'images.is_public = true OR images.is_common_use = true (foreignTable)',
-                range: '0-999'
-              });
-            }
-            // Note: Votes will be loaded when auth is ready (see useEffect above)
+            let finalSlides = slidesData;
+
+            // Apply stored order for logged-in user on refresh
             if (user && slidesData.length > 0) {
               const userProfileId = await getProfileId();
               if (userProfileId) {
                 setProfileId(userProfileId);
-                
-                // Restore saved index after refresh
-                const storageKey = `memeDeckIndex:${userProfileId}`;
-                const savedIndexStr = localStorage.getItem(storageKey);
+
+                try {
+                  const orderKey = getOrderStorageKey(userProfileId);
+                  const storedOrderStr = localStorage.getItem(orderKey);
+                  if (storedOrderStr) {
+                    const storedIds: string[] = JSON.parse(storedOrderStr);
+                    const byId = new Map(slidesData.map((s) => [s.captionId, s]));
+                    const orderedSlides: Slide[] = [];
+
+                    storedIds.forEach((id) => {
+                      const slide = byId.get(id);
+                      if (slide) {
+                        orderedSlides.push(slide);
+                        byId.delete(id);
+                      }
+                    });
+
+                    byId.forEach((slide) => {
+                      orderedSlides.push(slide);
+                    });
+
+                    if (orderedSlides.length === slidesData.length) {
+                      finalSlides = orderedSlides;
+                    }
+                  }
+                } catch (e) {
+                  console.error('[MemeDeck] Failed to restore memeDeckOrder on refresh', e);
+                }
+
+                // Restore saved index after refresh (relative to finalSlides)
+                const indexKey = getIndexStorageKey(userProfileId);
+                const savedIndexStr = localStorage.getItem(indexKey);
                 const savedIndex = savedIndexStr ? parseInt(savedIndexStr, 10) : 0;
-                const restoredIndex = Math.max(0, Math.min(savedIndex, slidesData.length - 1));
-                
+                const restoredIndex = Math.max(0, Math.min(savedIndex, finalSlides.length - 1));
+
                 isRestoringIndexRef.current = true;
                 setCurrentIndex(restoredIndex);
                 isRestoringIndexRef.current = false;
               }
+            }
+
+            setSlides(finalSlides);
+            setHasMore(finalSlides.length === CAPTIONS_PER_PAGE);
+            setCurrentPage(0); // Reset to first page on refresh
+            if (refreshCount !== null && refreshCount !== undefined) {
+              setDebugInfo({
+                totalAvailable: refreshCount,
+                returned: finalSlides.length,
+                filters: 'images.is_public = true OR images.is_common_use = true (foreignTable)',
+                range: '0-999'
+              });
             }
           }
         } catch (err) {
@@ -596,16 +676,83 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
     } finally {
       setIsVoting(false);
     }
-  }, [authLoaded, user, slides, currentIndex, isVoting, profileId]);
+  }, [authLoaded, user, slides, currentIndex, isVoting, profileId, userVotes]);
 
-  // Keyboard shortcuts: ArrowUp = Like, ArrowDown = Dislike
+  const handleShuffleMemes = useCallback(() => {
+    if (slides.length <= 1) return;
+
+    setSlides((prevSlides) => {
+      if (prevSlides.length <= 1) return prevSlides;
+
+      // Separate unrated vs rated memes
+      const isRated = (captionId: string) => {
+        return userVotes[captionId] !== undefined && userVotes[captionId] !== null;
+      };
+
+      const unrated = prevSlides.filter((s) => !isRated(s.captionId));
+      const rated = prevSlides.filter((s) => isRated(s.captionId));
+
+      // Shuffle each group independently
+      const shuffledUnrated = shuffle(unrated);
+      const shuffledRated = shuffle(rated);
+
+      // Combine with unrated first
+      const next = [...shuffledUnrated, ...shuffledRated];
+
+      const nextIndex = 0;
+      setCurrentIndex(nextIndex);
+
+      if (profileId) {
+        const orderKey = getOrderStorageKey(profileId);
+        const indexKey = getIndexStorageKey(profileId);
+        const orderIds = next.map((s) => s.captionId);
+        try {
+          localStorage.setItem(orderKey, JSON.stringify(orderIds));
+          localStorage.setItem(indexKey, String(nextIndex));
+        } catch (err) {
+          console.error('[MemeDeck] Failed to persist shuffled order', err);
+        }
+      }
+
+      return next;
+    });
+  }, [slides.length, userVotes, profileId]);
+
+  // Manual navigation - wrapped in useCallback for stability
+  const goToPrevious = useCallback(() => {
+    if (currentIndex > 0 && !isVoting) {
+      setSlideDirection('right');
+      setCurrentIndex(prev => prev - 1);
+    }
+  }, [currentIndex, isVoting]);
+
+  const goToNext = useCallback(() => {
+    if (currentIndex < slides.length - 1 && !isVoting) {
+      setSlideDirection('left');
+      setCurrentIndex(prev => prev + 1);
+    }
+  }, [currentIndex, slides.length, isVoting]);
+
+  // Jump to a specific index (for preview rail clicks)
+  const jumpToIndex = useCallback((index: number) => {
+    if (index < 0 || index >= slides.length || isVoting) return;
+    
+    const direction = index > currentIndex ? 'left' : 'right';
+    setSlideDirection(direction);
+    setCurrentIndex(index);
+  }, [currentIndex, slides.length, isVoting]);
+
+  // Keyboard shortcuts: All arrow keys for navigation and voting
   useEffect(() => {
-    const handleKeyPress = (event: KeyboardEvent) => {
+    function handleKey(e: KeyboardEvent) {
+      // Ignore if auth not loaded
+      if (!authLoaded) return;
+
       // Ignore if key is repeating (held down)
-      if (event.repeat) return;
+      if (e.repeat) return;
 
       // Ignore if user is typing in an input field
-      const target = event.target as HTMLElement;
+      const target = e.target as HTMLElement;
       if (
         target.tagName === 'INPUT' ||
         target.tagName === 'TEXTAREA' ||
@@ -617,39 +764,38 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
       // Ignore if voting is in progress or loading
       if (isVoting || isLoading) return;
 
-      // ArrowUp triggers LIKE (vote_value = 1)
-      if (event.key === 'ArrowUp') {
-        event.preventDefault(); // Prevent page scroll
+      // Left Arrow = Previous meme
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        goToPrevious();
+        return;
+      }
+
+      // Right Arrow = Next meme
+      if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        goToNext();
+        return;
+      }
+
+      // Up Arrow = Like
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
         handleVote(1);
+        return;
       }
-      // ArrowDown triggers DISLIKE (vote_value = -1)
-      else if (event.key === 'ArrowDown') {
-        event.preventDefault(); // Prevent page scroll
+
+      // Down Arrow = Dislike
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
         handleVote(-1);
+        return;
       }
-    };
-
-    window.addEventListener('keydown', handleKeyPress);
-    // Cleanup: Remove event listener on unmount
-    return () => {
-      window.removeEventListener('keydown', handleKeyPress);
-    };
-  }, [handleVote, isVoting, isLoading]);
-
-  // Manual navigation
-  const goToPrevious = () => {
-    if (currentIndex > 0 && !isVoting) {
-      setSlideDirection('right');
-      setCurrentIndex(prev => prev - 1);
     }
-  };
 
-  const goToNext = () => {
-    if (currentIndex < slides.length - 1 && !isVoting) {
-      setSlideDirection('left');
-      setCurrentIndex(prev => prev + 1);
-    }
-  };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [authLoaded, isVoting, isLoading, goToPrevious, goToNext, handleVote]);
 
   const currentSlide = slides[currentIndex];
   // PART 2: Get vote for current caption from votesByCaptionId lookup map
@@ -692,176 +838,207 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
   const progressPercentage = slides.length > 0 ? ((currentIndex + 1) / slides.length) * 100 : 0;
 
   return (
-    <div ref={deckRef} className="flex flex-col items-center justify-center min-h-[60vh]">
-      {/* Stats HUD - Top Right */}
-      <StatsHUD 
-        userVotes={userVotes} 
-        totalCount={slides.length} 
-        isLoggedIn={userId !== null}
-      />
-      
-      {/* Vote Load Error (RLS) - Dev only or small message */}
+    <div ref={deckRef} className="min-h-[60vh]">
+
+      {/* Vote Load Error (RLS) */}
       {voteLoadError && (
-        <div className={`fixed top-20 right-4 z-50 px-3 py-2 rounded-lg ${
-          process.env.NODE_ENV === 'development' 
-            ? 'bg-yellow-500/20 border border-yellow-500/30 text-yellow-200 text-xs' 
-            : 'bg-red-500/20 border border-red-500/30 text-red-200 text-xs'
-        }`} style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}>
+        <div
+          className="fixed top-20 right-4 z-40 px-3 py-2 rounded-lg bg-red-500/20 border border-red-500/40 text-red-100 text-xs"
+          style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}
+        >
           {voteLoadError}
         </div>
       )}
-      
-      {/* Centered Container */}
-      <div className="max-w-[1000px] mx-auto px-4 sm:px-8 mb-8 w-full">
-        {/* Two Column Layout: TV Left, Remote Right - Vertically Centered */}
-        <div className="flex flex-col lg:flex-row items-center justify-center gap-6 lg:gap-8">
-          {/* LEFT: TV Component */}
-          <div className="w-full">
-            <div
-              key={currentIndex}
-              className={`bg-[#fafafa] dark:bg-gray-800 rounded-[20px] shadow-[0_10px_30px_rgba(0,0,0,0.08)] border border-gray-200/50 dark:border-gray-700/50 overflow-hidden transition-transform duration-300 ${
-                slideDirection === 'left' ? 'slide-animation-left' : slideDirection === 'right' ? 'slide-animation-right' : ''
-              }`}
-              onAnimationEnd={() => setSlideDirection(null)}
-            >
-              {/* TV Container with Antennas */}
-              <div className="tv-container">
-                {/* Antennas */}
-                <div className="tv-antennas">
-                  <div className="tv-antenna-left"></div>
-                  <div className="tv-antenna-right"></div>
-                </div>
 
-                {/* TV Frame */}
-                <div className="tv-frame mx-auto mt-6 mb-0">
-                  {/* Channel Indicator */}
-                  <div className="tv-channel-indicator">
-                    <span>CH {String(currentIndex + 1).padStart(2, '0')}</span>
-                    <span>{currentIndex + 1} / {slides.length}</span>
-                  </div>
-
-                  {/* TV Screen */}
-                  <div className="tv-screen">
-                    {currentSlide.imageUrl ? (
-                      <img
-                        key={currentSlide.captionId}
-                        src={currentSlide.imageUrl}
-                        alt={currentSlide.imageDescription || 'Meme'}
-                        className="w-full h-auto max-h-[320px] sm:max-h-[420px] object-cover rounded-2xl relative z-0"
-                        style={{ animation: 'fadeIn 0.3s ease-in' }}
-                      />
-                    ) : (
-                      <div className="w-full h-[320px] sm:h-[420px] flex items-center justify-center text-gray-400 rounded-2xl">
-                        No image
-                      </div>
-                    )}
-                    {/* Power Light */}
-                    <div className="tv-power-light"></div>
-                    {/* Speaker Grill */}
-                    <div className="tv-speaker-grill">
-                      {[...Array(5)].map((_, i) => (
-                        <div key={i} className="tv-speaker-dot"></div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Speech Bubble Caption */}
-                <div className="speech-bubble mx-6">
-                  <p className="text-[1.4rem] font-semibold text-foreground text-center leading-[1.5]" style={{ fontFamily: 'var(--font-fredoka)', fontWeight: 600 }}>
-                    {currentSlide.captionText || 'No caption'}
-                  </p>
-                </div>
+      {/* Hero Meme Player */}
+      <div className="max-w-6xl mx-auto px-2 sm:px-4 lg:px-0 pt-4 sm:pt-6 lg:pt-10">
+        <div
+          key={currentIndex}
+          className={`grid lg:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)] gap-6 sm:gap-8 items-stretch bg-black/70 border border-white/10 rounded-3xl shadow-[0_24px_80px_rgba(0,0,0,0.9)] backdrop-blur-xl p-4 sm:p-6 lg:p-8 transition-transform duration-300 ${
+            slideDirection === 'left'
+              ? 'slide-animation-left'
+              : slideDirection === 'right'
+              ? 'slide-animation-right'
+              : ''
+          }`}
+          onAnimationEnd={() => setSlideDirection(null)}
+        >
+          {/* Left: Cinematic meme frame */}
+          <div className="relative overflow-hidden rounded-2xl bg-zinc-950 border border-white/10 flex items-center justify-center">
+            {currentSlide.imageUrl ? (
+              <img
+                key={currentSlide.captionId}
+                src={currentSlide.imageUrl}
+                alt={currentSlide.imageDescription || 'Meme'}
+                className="w-full h-full object-contain max-h-[420px] sm:max-h-[520px]"
+                style={{ animation: 'fadeIn 0.3s ease-in' }}
+              />
+            ) : (
+              <div className="w-full h-[260px] sm:h-[340px] flex items-center justify-center text-gray-500 text-sm sm:text-base">
+                No image available
               </div>
+            )}
+
+            {/* Overlay gradient & chrome */}
+            <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(255,255,255,0.18),transparent_55%),radial-gradient(circle_at_bottom,_rgba(0,0,0,0.9),transparent_60%)]" />
+            <div className="absolute top-3 left-3 px-2.5 py-1 rounded-full bg-black/70 border border-white/15 text-[11px] uppercase tracking-[0.15em] text-gray-300" style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}>
+              Currently rating
+            </div>
+            <div className="absolute bottom-3 left-3 flex items-center gap-2 text-xs text-gray-200" style={{ fontFamily: 'var(--font-poppins)', fontWeight: 400 }}>
+              <span className="inline-flex h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
+              <span>
+                {currentIndex + 1} / {slides.length}
+              </span>
             </div>
           </div>
 
-          {/* RIGHT: Remote Control */}
-          <div className="w-full lg:w-auto flex justify-center">
-            <div className="remote-control">
-              {/* IR Sensor */}
-              <div className="remote-ir-sensor"></div>
-
-              {/* Speaker Holes */}
-              <div className="remote-speaker-holes">
-                {[...Array(8)].map((_, i) => (
-                  <div key={i} className="remote-speaker-hole"></div>
-                ))}
+          {/* Right: Caption + controls */}
+          <div className="flex flex-col justify-between gap-6 sm:gap-8">
+            <div className="space-y-4 sm:space-y-5">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p
+                    className="text-[11px] uppercase tracking-[0.2em] text-gray-400"
+                    style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}
+                  >
+                    Meme caption
+                  </p>
+                  <h2
+                    className="mt-1 text-xl sm:text-2xl lg:text-3xl font-semibold text-white whitespace-normal break-words leading-relaxed"
+                    style={{ fontFamily: 'var(--font-poppins)' }}
+                  >
+                    {currentSlide.captionText || 'No caption yet'}
+                  </h2>
+                </div>
+                <div className="hidden sm:flex flex-col items-end text-xs text-gray-400" style={{ fontFamily: 'var(--font-poppins)', fontWeight: 400 }}>
+                  <span className="text-[11px] uppercase tracking-[0.16em] text-gray-500">
+                    Progress
+                  </span>
+                  <span className="text-sm text-gray-200">
+                    {currentIndex + 1} / {slides.length}
+                  </span>
+                </div>
               </div>
 
-              {/* Decorative D-Pad */}
-              <div className="remote-dpad">
-                <div className="remote-dpad-outer"></div>
-                <div className="remote-dpad-inner"></div>
+              {/* Progress bar */}
+              <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-gradient-to-r from-red-500 via-pink-500 to-purple-500 transition-all duration-300"
+                  style={{ width: `${progressPercentage}%` }}
+                />
               </div>
 
-              {/* Like Button */}
-              <button
-                onClick={() => handleVote(1)}
-                disabled={isVoting || !authLoaded}
-                className={`remote-vote-button remote-button-like ${
-                  isVoting || !authLoaded
-                    ? 'remote-button-disabled'
-                    : myVote === 1
-                    ? 'remote-button-active'
-                    : ''
-                }`}
-                style={{
-                  fontFamily: 'var(--font-poppins)',
-                }}
-              >
-                <span className={`remote-button-icon transition-transform duration-150 ${clickedButton === 'like' ? 'scale-110' : ''}`}>
-                  ▲
-                </span>
-                <span className="remote-button-label">LIKE</span>
-              </button>
+              {/* Inline stats pills */}
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                {/* Reuse StatsHUD logic by recomputing here */}
+                {(() => {
+                  const likedCount = Object.values(userVotes).filter((v) => v === 1).length;
+                  const dislikedCount = Object.values(userVotes).filter((v) => v === -1).length;
+                  const leftCount = slides.length - (likedCount + dislikedCount);
+                  return (
+                    <>
+                      <span className="inline-flex items-center gap-1 rounded-full bg-white/5 border border-white/15 px-2.5 py-1 text-[11px] text-gray-100" style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}>
+                        <span>👍</span>
+                        <span>Liked: {likedCount}</span>
+                      </span>
+                      <span className="inline-flex items-center gap-1 rounded-full bg-white/5 border border-white/15 px-2.5 py-1 text-[11px] text-gray-100" style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}>
+                        <span>👎</span>
+                        <span>Disliked: {dislikedCount}</span>
+                      </span>
+                      <span className="inline-flex items-center gap-1 rounded-full bg-white/5 border border-white/15 px-2.5 py-1 text-[11px] text-gray-100" style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}>
+                        <span>⏳</span>
+                        <span>Left: {leftCount}</span>
+                      </span>
+                    </>
+                  );
+                })()}
+              </div>
+            </div>
 
-              {/* Dislike Button */}
-              <button
-                onClick={() => handleVote(-1)}
-                disabled={isVoting || !authLoaded}
-                className={`remote-vote-button remote-button-dislike ${
-                  isVoting || !authLoaded
-                    ? 'remote-button-disabled'
-                    : myVote === -1
-                    ? 'remote-button-active'
-                    : ''
-                }`}
-                style={{
-                  fontFamily: 'var(--font-poppins)',
-                }}
-              >
-                <span className={`remote-button-icon transition-transform duration-150 ${clickedButton === 'dislike' ? 'scale-110' : ''}`}>
-                  ▼
-                </span>
-                <span className="remote-button-label">DISLIKE</span>
-              </button>
+            {/* Vote controls */}
+            <div className="space-y-3 sm:space-y-4">
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <button
+                    onClick={() => handleVote(1)}
+                    disabled={isVoting || !authLoaded}
+                    className={`flex-1 inline-flex items-center justify-center rounded-full px-4 py-2.5 text-sm sm:text-base font-semibold transition-all duration-200 ${
+                      isVoting || !authLoaded
+                        ? 'bg-gray-700 text-gray-500 cursor-not-allowed'
+                        : myVote === 1
+                        ? 'bg-emerald-500 text-white shadow-[0_0_20px_rgba(16,185,129,0.6)]'
+                        : 'bg-emerald-600/20 text-emerald-200 border border-emerald-500/40 hover:bg-emerald-500/30 hover:border-emerald-400/70'
+                    }`}
+                    style={{ fontFamily: 'var(--font-poppins)' }}
+                  >
+                    <span className={`mr-2 text-lg transition-transform duration-150 ${clickedButton === 'like' ? 'scale-110' : ''}`}>
+                      👍
+                    </span>
+                    Like
+                  </button>
 
-              {/* Vote Status Message */}
-              {myVote !== undefined && currentSlide && (
-                <div className={`mt-3 px-3 py-1.5 rounded-lg text-xs text-center ${
-                  myVote === 1 
-                    ? 'bg-green-500/20 border border-green-500/30 text-green-200' 
-                    : 'bg-red-500/20 border border-red-500/30 text-red-200'
-                }`} style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}>
-                  {myVote === 1 ? 'You liked this caption' : 'You disliked this caption'}
+                  <button
+                    onClick={() => handleVote(-1)}
+                    disabled={isVoting || !authLoaded}
+                    className={`flex-1 inline-flex items-center justify-center rounded-full px-4 py-2.5 text-sm sm:text-base font-semibold transition-all duration-200 ${
+                      isVoting || !authLoaded
+                        ? 'bg-gray-700 text-gray-500 cursor-not-allowed'
+                        : myVote === -1
+                        ? 'bg-red-500 text-white shadow-[0_0_20px_rgba(239,68,68,0.6)]'
+                        : 'bg-red-600/20 text-red-200 border border-red-500/40 hover:bg-red-500/30 hover:border-red-400/70'
+                    }`}
+                    style={{ fontFamily: 'var(--font-poppins)' }}
+                  >
+                    <span className={`mr-2 text-lg transition-transform duration-150 ${clickedButton === 'dislike' ? 'scale-110' : ''}`}>
+                      👎
+                    </span>
+                    Dislike
+                  </button>
                 </div>
-              )}
 
-              {/* Vote Error Display */}
-              {voteError && (
-                <div className="mt-2 px-3 py-1.5 rounded-lg bg-red-500/20 border border-red-500/30 text-red-200 text-xs text-center" style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}>
-                  {voteError}
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex-1 min-w-0">
+                    {/* Vote Status Message */}
+                    {myVote !== undefined && currentSlide && (
+                      <div
+                        className={`px-3 py-1.5 rounded-full text-[11px] sm:text-xs text-center inline-flex items-center gap-1 ${
+                          myVote === 1
+                            ? 'bg-emerald-500/15 border border-emerald-500/40 text-emerald-200'
+                            : 'bg-red-500/15 border border-red-500/40 text-red-200'
+                        }`}
+                        style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}
+                      >
+                        <span>{myVote === 1 ? 'You liked this caption' : 'You disliked this caption'}</span>
+                      </div>
+                    )}
+                    {voteError && (
+                      <div
+                        className="mt-1 px-3 py-1.5 rounded-full bg-red-500/15 border border-red-500/40 text-red-200 text-[11px] sm:text-xs inline-block"
+                        style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}
+                      >
+                        {voteError}
+                      </div>
+                    )}
+                  </div>
                 </div>
-              )}
-
+              </div>
             </div>
           </div>
         </div>
+
+        {/* Preview Rail */}
+        {slides.length > 0 && (
+          <PreviewRail
+            captions={slides}
+            currentIndex={currentIndex}
+            onSelectIndex={jumpToIndex}
+            votesByCaptionId={userVotes}
+          />
+        )}
       </div>
 
       {/* Manual Navigation Arrows */}
-      <div className="flex gap-4 items-center">
+      <div className="flex gap-4 items-center justify-center mt-6">
         <button
           onClick={goToPrevious}
           disabled={currentIndex === 0 || isVoting}
@@ -885,6 +1062,19 @@ export default function MemeDeck({ userId, refreshTrigger }: MemeDeckProps) {
           style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}
         >
           Next →
+        </button>
+        <button
+          onClick={handleShuffleMemes}
+          disabled={!votesHydrated || !authLoaded || slides.length <= 1 || isVoting}
+          className={`px-4 py-2 rounded-lg transition-all duration-200 flex items-center gap-2 ${
+            !votesHydrated || !authLoaded || slides.length <= 1 || isVoting
+              ? 'bg-gray-300 dark:bg-gray-700 text-gray-500 dark:text-gray-400 cursor-not-allowed'
+              : 'bg-gray-600 hover:bg-gray-700 hover:scale-[1.02] hover:shadow-lg text-white'
+          }`}
+          style={{ fontFamily: 'var(--font-poppins)', fontWeight: 500 }}
+        >
+          <span className="text-sm">🔀</span>
+          <span>Shuffle</span>
         </button>
       </div>
 
