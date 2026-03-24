@@ -109,27 +109,26 @@ function ImageVoteButtons({
         }
       }
 
-      // Check if existing vote exists to preserve created_datetime_utc
+      // Check if existing vote exists to preserve created_by_user_id on updates
       const { data: existingVote } = await supabase
         .from('caption_votes')
-        .select('created_datetime_utc')
+        .select('created_by_user_id')
         .eq('profile_id', profileId)
         .eq('caption_id', captionId)
         .single();
 
-      const nowIso = new Date().toISOString();
       const voteValue = voteType === 'up' ? 1 : -1;
 
       const voteData = {
         caption_id: captionId,
         profile_id: profileId,
         vote_value: voteValue,
-        created_datetime_utc: existingVote?.created_datetime_utc || nowIso,
-        modified_datetime_utc: nowIso,
+        created_by_user_id: existingVote?.created_by_user_id || profileId,
+        modified_by_user_id: profileId,
       };
 
       // Use UPSERT with onConflict
-      const { data: voteResult, error: voteError } = await supabase
+      const { error: voteError } = await supabase
         .from('caption_votes')
         .upsert(voteData, {
           onConflict: 'profile_id,caption_id',

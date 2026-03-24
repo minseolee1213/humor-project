@@ -60,10 +60,8 @@ export async function POST(req: Request) {
 
     // Use user.id as profile_id (profiles.id = user.id in our schema)
     const profileId = user.id;
-    const now = new Date().toISOString();
-
-    // Strategy: Try UPDATE first (preserves created_datetime_utc), then INSERT if no rows updated
-    // This ensures created_datetime_utc is only set on inserts, never overwritten on updates
+    // Strategy: Try UPDATE first, then INSERT if no rows updated
+    // This preserves creator audit fields and avoids overwriting insert-only metadata
     
     try {
       // Step 1: Attempt UPDATE existing row
@@ -72,7 +70,7 @@ export async function POST(req: Request) {
         .from('caption_votes')
         .update({
           vote_value: voteValue,
-          modified_datetime_utc: now,
+          modified_by_user_id: profileId,
         })
         .eq('profile_id', profileId)
         .eq('caption_id', captionId)
@@ -126,8 +124,8 @@ export async function POST(req: Request) {
           profile_id: profileId,
           caption_id: captionId,
           vote_value: voteValue,
-          created_datetime_utc: now, // Always set on insert (NOT NULL constraint)
-          modified_datetime_utc: now,
+          created_by_user_id: profileId,
+          modified_by_user_id: profileId,
         })
         .select()
         .single();
@@ -141,7 +139,7 @@ export async function POST(req: Request) {
             .from('caption_votes')
             .update({
               vote_value: voteValue,
-              modified_datetime_utc: now,
+              modified_by_user_id: profileId,
             })
             .eq('profile_id', profileId)
             .eq('caption_id', captionId)

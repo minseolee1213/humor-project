@@ -100,14 +100,12 @@ export async function POST(
     }
 
     // UPSERT vote into caption_votes table
-    // Schema: caption_id, profile_id, vote_value, created_datetime_utc, modified_datetime_utc
+    // Schema includes audit columns: created_by_user_id / modified_by_user_id
     // Unique constraint on (profile_id, caption_id)
-    const nowIso = new Date().toISOString();
-    
-    // Check if vote already exists to preserve created_datetime_utc
+    // Check if vote already exists so we can preserve created_by_user_id on updates
     const { data: existingVote } = await supabase
       .from('caption_votes')
-      .select('created_datetime_utc')
+      .select('created_by_user_id')
       .eq('profile_id', profileId)
       .eq('caption_id', captionId)
       .single();
@@ -116,8 +114,8 @@ export async function POST(
       caption_id: captionId,
       profile_id: profileId,
       vote_value: voteValue,
-      created_datetime_utc: existingVote?.created_datetime_utc || nowIso, // Preserve existing or set new
-      modified_datetime_utc: nowIso, // Always update
+      created_by_user_id: existingVote?.created_by_user_id || profileId,
+      modified_by_user_id: profileId,
     };
 
     // Use UPSERT with onConflict to handle unique constraint
